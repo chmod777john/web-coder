@@ -39,9 +39,18 @@ export type ClientMessage =
 export type ServerMessage =
   | {
       type: "session";
+      sessionId: string;
       panes: readonly PaneDefinition[];
       cwd: string;
       shell: string;
+    }
+  | {
+      type: "snapshot";
+      paneId: PaneId;
+      data: string;
+      state: "live" | "exited";
+      exitCode: number | null;
+      signal: number | null;
     }
   | {
       type: "output";

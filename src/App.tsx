@@ -18,6 +18,7 @@ type BrowserTmuxDebugApi = {
     connectionState: ConnectionState;
     cwd: string;
     runtime: Record<PaneId, PaneRuntime>;
+    sessionId: string;
     shell: string;
   };
   restartPane: (paneId: PaneId) => void;
@@ -29,6 +30,8 @@ declare global {
     __browserTmux?: BrowserTmuxDebugApi;
   }
 }
+
+const SESSION_STORAGE_KEY = "browser-tmux/session-id";
 
 function createInitialRuntime(): Record<PaneId, PaneRuntime> {
   return {
@@ -50,26 +53,80 @@ function createInitialRuntime(): Record<PaneId, PaneRuntime> {
   };
 }
 
-function getSocketUrl() {
-  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${protocol}://${window.location.host}/ws`;
-}
-
-export function App() {
-  const terminalsRef = useRef(new Map<PaneId, TerminalHandle>());
-  const pendingOutputRef = useRef<Record<PaneId, string[]>>({
+function createPendingOutputBuffer(): Record<PaneId, string[]> {
+  return {
     workspace: [],
     server: [],
     scratch: [],
-  });
+  };
+}
+
+function createPendingSnapshotBuffer(): Record<PaneId, string | null> {
+  return {
+    workspace: null,
+    server: null,
+    scratch: null,
+  };
+}
+
+function createSessionId() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getOrCreateSessionId() {
+  try {
+    const stored = window.localStorage.getItem(SESSION_STORAGE_KEY);
+
+    if (stored) {
+      return stored;
+    }
+
+    const next = createSessionId();
+    window.localStorage.setItem(SESSION_STORAGE_KEY, next);
+    return next;
+  } catch {
+    return createSessionId();
+  }
+}
+
+function persistSessionId(sessionId: string) {
+  try {
+    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  } catch {
+    // Ignore storage failures and keep the in-memory session id.
+  }
+}
+
+function getSocketUrl(sessionId: string) {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const url = new URL(`${protocol}://${window.location.host}/ws`);
+  url.searchParams.set("sessionId", sessionId);
+  return url.toString();
+}
+
+export function App() {
+  const sessionIdRef = useRef(getOrCreateSessionId());
+  const terminalsRef = useRef(new Map<PaneId, TerminalHandle>());
+  const pendingOutputRef = useRef(createPendingOutputBuffer());
+  const pendingSnapshotRef = useRef(createPendingSnapshotBuffer());
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  const seenSessionRef = useRef(false);
 
   const [activePane, setActivePane] = useState<PaneId>("workspace");
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [cwd, setCwd] = useState("");
   const [shell, setShell] = useState("");
+  const [sessionId, setSessionId] = useState(sessionIdRef.current);
   const [runtime, setRuntime] = useState<Record<PaneId, PaneRuntime>>(createInitialRuntime);
 
   const connectionLabel = useMemo(() => {
@@ -83,31 +140,40 @@ export function App() {
     }
   }, [connectionState]);
 
-  useEffect(() => {
-    let stopped = false;
+  const sendMessage = (message: unknown) => {
+    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+      return;
+    }
 
-    const send = (message: unknown) => {
-      if (socketRef.current?.readyState !== WebSocket.OPEN) {
-        return;
+    socketRef.current.send(JSON.stringify(message));
+  };
+
+  const handlePaneReady = (paneId: PaneId, terminal: TerminalHandle) => {
+    terminalsRef.current.set(paneId, terminal);
+
+    const snapshot = pendingSnapshotRef.current[paneId];
+    if (snapshot !== null) {
+      terminal.reset();
+
+      if (snapshot) {
+        terminal.write(snapshot);
       }
 
-      socketRef.current.send(JSON.stringify(message));
-    };
+      pendingSnapshotRef.current[paneId] = null;
+    }
 
-    const flushPendingOutput = (paneId: PaneId) => {
-      const terminal = terminalsRef.current.get(paneId);
-      const buffer = pendingOutputRef.current[paneId];
-
-      if (!terminal || buffer.length === 0) {
-        return;
-      }
-
-      for (const chunk of buffer) {
+    const pendingOutput = pendingOutputRef.current[paneId];
+    if (pendingOutput.length > 0) {
+      for (const chunk of pendingOutput) {
         terminal.write(chunk);
       }
 
       pendingOutputRef.current[paneId] = [];
-    };
+    }
+  };
+
+  useEffect(() => {
+    let stopped = false;
 
     const writeToPane = (paneId: PaneId, data: string) => {
       const terminal = terminalsRef.current.get(paneId);
@@ -118,12 +184,6 @@ export function App() {
       }
 
       terminal.write(data);
-    };
-
-    const pushSystemLine = (message: string) => {
-      for (const pane of PANES) {
-        writeToPane(pane.id, `\r\n\x1b[33m${message}\x1b[0m\r\n`);
-      }
     };
 
     const syncTerminalSizes = () => {
@@ -137,7 +197,7 @@ export function App() {
         terminal.fit();
 
         const { cols, rows } = terminal.getSize();
-        send({
+        sendMessage({
           type: "resize",
           paneId: pane.id,
           cols,
@@ -149,20 +209,44 @@ export function App() {
     const handleMessage = (message: ServerMessage) => {
       switch (message.type) {
         case "session": {
+          sessionIdRef.current = message.sessionId;
+          persistSessionId(message.sessionId);
+          setSessionId(message.sessionId);
           setCwd(message.cwd);
           setShell(message.shell);
           setRuntime(createInitialRuntime());
+          pendingOutputRef.current = createPendingOutputBuffer();
+          pendingSnapshotRef.current = createPendingSnapshotBuffer();
 
           for (const pane of PANES) {
             terminalsRef.current.get(pane.id)?.reset();
           }
 
-          if (seenSessionRef.current) {
-            pushSystemLine("Session restarted.");
+          requestAnimationFrame(syncTerminalSizes);
+          return;
+        }
+        case "snapshot": {
+          pendingOutputRef.current[message.paneId] = [];
+
+          const terminal = terminalsRef.current.get(message.paneId);
+          if (terminal) {
+            terminal.reset();
+
+            if (message.data) {
+              terminal.write(message.data);
+            }
+          } else {
+            pendingSnapshotRef.current[message.paneId] = message.data;
           }
 
-          seenSessionRef.current = true;
-          requestAnimationFrame(syncTerminalSizes);
+          setRuntime((current) => ({
+            ...current,
+            [message.paneId]: {
+              state: message.state,
+              exitCode: message.exitCode,
+              signal: message.signal,
+            },
+          }));
           return;
         }
         case "output": {
@@ -189,7 +273,9 @@ export function App() {
           return;
         }
         case "error": {
-          pushSystemLine(message.message);
+          for (const pane of PANES) {
+            writeToPane(pane.id, `\r\n\x1b[33m${message.message}\x1b[0m\r\n`);
+          }
         }
       }
     };
@@ -197,7 +283,7 @@ export function App() {
     const connect = () => {
       setConnectionState("connecting");
 
-      const socket = new WebSocket(getSocketUrl());
+      const socket = new WebSocket(getSocketUrl(sessionIdRef.current));
       socketRef.current = socket;
 
       socket.addEventListener("open", () => {
@@ -219,8 +305,7 @@ export function App() {
         }
 
         setConnectionState("disconnected");
-        pushSystemLine("Socket closed. Reconnecting...");
-        reconnectTimerRef.current = window.setTimeout(connect, 1400);
+        reconnectTimerRef.current = window.setTimeout(connect, 1_400);
       });
     };
 
@@ -237,14 +322,6 @@ export function App() {
     };
   }, []);
 
-  const sendMessage = (message: unknown) => {
-    if (socketRef.current?.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    socketRef.current.send(JSON.stringify(message));
-  };
-
   useEffect(() => {
     window.__browserTmux = {
       getPaneText: (paneId) => terminalsRef.current.get(paneId)?.getText() ?? "",
@@ -253,6 +330,7 @@ export function App() {
         connectionState,
         cwd,
         runtime,
+        sessionId,
         shell,
       }),
       restartPane: (paneId) => {
@@ -273,7 +351,7 @@ export function App() {
     return () => {
       delete window.__browserTmux;
     };
-  }, [activePane, connectionState, cwd, runtime, shell]);
+  }, [activePane, connectionState, cwd, runtime, sessionId, shell]);
 
   const activePaneMeta = PANES.find((pane) => pane.id === activePane) ?? PANES[0];
 
@@ -314,18 +392,7 @@ export function App() {
                   data,
                 });
               }}
-              onReady={(paneId, terminal) => {
-                terminalsRef.current.set(paneId, terminal);
-
-                const pending = pendingOutputRef.current[paneId];
-                if (pending.length > 0) {
-                  for (const chunk of pending) {
-                    terminal.write(chunk);
-                  }
-
-                  pendingOutputRef.current[paneId] = [];
-                }
-              }}
+              onReady={handlePaneReady}
               onResize={(paneId, cols, rows) => {
                 sendMessage({
                   type: "resize",
@@ -356,18 +423,7 @@ export function App() {
                   data,
                 });
               }}
-              onReady={(paneId, terminal) => {
-                terminalsRef.current.set(paneId, terminal);
-
-                const pending = pendingOutputRef.current[paneId];
-                if (pending.length > 0) {
-                  for (const chunk of pending) {
-                    terminal.write(chunk);
-                  }
-
-                  pendingOutputRef.current[paneId] = [];
-                }
-              }}
+              onReady={handlePaneReady}
               onResize={(paneId, cols, rows) => {
                 sendMessage({
                   type: "resize",
@@ -395,18 +451,7 @@ export function App() {
                   data,
                 });
               }}
-              onReady={(paneId, terminal) => {
-                terminalsRef.current.set(paneId, terminal);
-
-                const pending = pendingOutputRef.current[paneId];
-                if (pending.length > 0) {
-                  for (const chunk of pending) {
-                    terminal.write(chunk);
-                  }
-
-                  pendingOutputRef.current[paneId] = [];
-                }
-              }}
+              onReady={handlePaneReady}
               onResize={(paneId, cols, rows) => {
                 sendMessage({
                   type: "resize",
@@ -430,7 +475,7 @@ export function App() {
         <footer className="statusbar">
           <div className="statusbar__pill">
             <span>session</span>
-            <strong>browser-tmux</strong>
+            <strong>{sessionId}</strong>
           </div>
           <div className="statusbar__pill">
             <span>cwd</span>
@@ -438,7 +483,7 @@ export function App() {
           </div>
           <div className="statusbar__pill">
             <span>tip</span>
-            <strong>click a pane and type directly</strong>
+            <strong>refresh keeps the same shell session</strong>
           </div>
         </footer>
       </div>

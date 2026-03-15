@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, join, resolve } from "node:path";
@@ -13,6 +14,22 @@ const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_DIR = resolve(ROOT_DIR, "dist");
 const DIST_INDEX = join(DIST_DIR, "index.html");
 const PORT = Number(process.env.PORT ?? 3001);
+const HISTORY_LIMIT = 200_000;
+const SESSION_TTL_MS = 30 * 60 * 1_000;
+
+type PaneStatus = {
+  state: "live" | "exited";
+  exitCode: number | null;
+  signal: number | null;
+};
+
+type PaneRuntime = {
+  cols: number;
+  history: string;
+  pty: IPty | null;
+  rows: number;
+  status: PaneStatus;
+};
 
 function resolveShell() {
   if (process.platform === "win32") {
@@ -52,22 +69,73 @@ function isClientMessage(value: unknown): value is ClientMessage {
   return candidate.type === "restart" && isPaneId(candidate.paneId);
 }
 
-class BrowserTmuxSession {
-  readonly #panes = new Map<PaneId, IPty>();
+function createPaneRuntime(): PaneRuntime {
+  return {
+    cols: 120,
+    history: "",
+    pty: null,
+    rows: 32,
+    status: {
+      state: "exited",
+      exitCode: null,
+      signal: null,
+    },
+  };
+}
+
+function appendHistory(history: string, chunk: string) {
+  const next = history + chunk;
+
+  if (next.length <= HISTORY_LIMIT) {
+    return next;
+  }
+
+  return next.slice(next.length - HISTORY_LIMIT);
+}
+
+const sessions = new Map<string, PersistentBrowserTmuxSession>();
+
+class PersistentBrowserTmuxSession {
+  readonly #panes: Record<PaneId, PaneRuntime>;
   readonly #shell = resolveShell();
+  readonly #sockets = new Set<WebSocket>();
+  #cleanupTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly socket: WebSocket) {}
+  constructor(readonly id: string) {
+    this.#panes = {
+      workspace: createPaneRuntime(),
+      server: createPaneRuntime(),
+      scratch: createPaneRuntime(),
+    };
 
-  start() {
-    this.send({
+    for (const pane of PANES) {
+      this.spawnPane(pane.id);
+    }
+  }
+
+  attach(socket: WebSocket) {
+    this.clearCleanupTimer();
+
+    this.sendTo(socket, {
       type: "session",
+      sessionId: this.id,
       panes: PANES,
       cwd: ROOT_DIR,
       shell: this.#shell,
     });
 
     for (const pane of PANES) {
-      this.spawnPane(pane.id);
+      this.sendSnapshotTo(socket, pane.id);
+    }
+
+    this.#sockets.add(socket);
+  }
+
+  detach(socket: WebSocket) {
+    this.#sockets.delete(socket);
+
+    if (this.#sockets.size === 0) {
+      this.scheduleCleanup();
     }
   }
 
@@ -77,7 +145,7 @@ class BrowserTmuxSession {
     try {
       payload = JSON.parse(raw);
     } catch {
-      this.send({
+      this.broadcast({
         type: "error",
         message: "Invalid JSON payload.",
       });
@@ -85,7 +153,7 @@ class BrowserTmuxSession {
     }
 
     if (!isClientMessage(payload)) {
-      this.send({
+      this.broadcast({
         type: "error",
         message: "Unsupported client message.",
       });
@@ -94,13 +162,14 @@ class BrowserTmuxSession {
 
     switch (payload.type) {
       case "input": {
-        this.#panes.get(payload.paneId)?.write(payload.data);
+        this.#panes[payload.paneId].pty?.write(payload.data);
         return;
       }
       case "resize": {
-        const cols = Math.max(40, Math.floor(payload.cols));
-        const rows = Math.max(10, Math.floor(payload.rows));
-        this.#panes.get(payload.paneId)?.resize(cols, rows);
+        const pane = this.#panes[payload.paneId];
+        pane.cols = Math.max(40, Math.floor(payload.cols));
+        pane.rows = Math.max(10, Math.floor(payload.rows));
+        pane.pty?.resize(pane.cols, pane.rows);
         return;
       }
       case "restart": {
@@ -110,77 +179,170 @@ class BrowserTmuxSession {
   }
 
   dispose() {
-    for (const pane of this.#panes.values()) {
-      pane.kill();
+    this.clearCleanupTimer();
+
+    for (const pane of Object.values(this.#panes)) {
+      pane.pty?.kill();
+      pane.pty = null;
     }
 
-    this.#panes.clear();
+    this.#sockets.clear();
   }
 
   private restartPane(paneId: PaneId) {
-    this.#panes.get(paneId)?.kill();
-    this.#panes.delete(paneId);
+    const pane = this.#panes[paneId];
+    const current = pane.pty;
+
+    if (current) {
+      pane.pty = null;
+      current.kill();
+    }
+
     this.spawnPane(paneId);
   }
 
   private spawnPane(paneId: PaneId) {
+    const pane = this.#panes[paneId];
     const shellArgs = process.platform === "win32" ? [] : ["-i"];
-    const pane = spawn(this.#shell, shellArgs, {
-      name: "xterm-256color",
-      cols: 120,
-      rows: 32,
-      cwd: ROOT_DIR,
-      env: {
-        ...process.env,
-        COLORTERM: "truecolor",
-        TERM: "xterm-256color",
-      },
-    });
 
-    this.#panes.set(paneId, pane);
-    this.send({
-      type: "status",
-      paneId,
-      state: "live",
-      exitCode: null,
-      signal: null,
-    });
-
-    pane.onData((data) => {
-      if (this.#panes.get(paneId) !== pane) {
-        return;
-      }
-
-      this.send({
-        type: "output",
-        paneId,
-        data,
+    try {
+      const pty = spawn(this.#shell, shellArgs, {
+        name: "xterm-256color",
+        cols: pane.cols,
+        rows: pane.rows,
+        cwd: ROOT_DIR,
+        env: {
+          ...process.env,
+          COLORTERM: "truecolor",
+          TERM: "xterm-256color",
+        },
       });
-    });
 
-    pane.onExit(({ exitCode, signal }) => {
-      if (this.#panes.get(paneId) !== pane) {
-        return;
-      }
+      pane.pty = pty;
+      pane.status = {
+        state: "live",
+        exitCode: null,
+        signal: null,
+      };
 
-      this.#panes.delete(paneId);
-      this.send({
+      this.broadcast({
         type: "status",
         paneId,
-        state: "exited",
-        exitCode: exitCode ?? null,
-        signal: signal ?? null,
+        state: "live",
+        exitCode: null,
+        signal: null,
       });
-    });
+
+      pty.onData((data) => {
+        if (this.#panes[paneId].pty !== pty) {
+          return;
+        }
+
+        pane.history = appendHistory(pane.history, data);
+        this.broadcast({
+          type: "output",
+          paneId,
+          data,
+        });
+      });
+
+      pty.onExit(({ exitCode, signal }) => {
+        if (this.#panes[paneId].pty !== pty) {
+          return;
+        }
+
+        pane.pty = null;
+        pane.status = {
+          state: "exited",
+          exitCode: exitCode ?? null,
+          signal: signal ?? null,
+        };
+
+        this.broadcast({
+          type: "status",
+          paneId,
+          state: "exited",
+          exitCode: exitCode ?? null,
+          signal: signal ?? null,
+        });
+      });
+    } catch (error) {
+      pane.pty = null;
+      pane.status = {
+        state: "exited",
+        exitCode: 1,
+        signal: null,
+      };
+
+      this.broadcast({
+        type: "error",
+        message: error instanceof Error ? error.message : "Failed to spawn shell.",
+      });
+    }
   }
 
-  private send(message: ServerMessage) {
-    if (this.socket.readyState !== this.socket.OPEN) {
+  private scheduleCleanup() {
+    if (this.#cleanupTimer) {
       return;
     }
 
-    this.socket.send(JSON.stringify(message));
+    this.#cleanupTimer = setTimeout(() => {
+      if (this.#sockets.size > 0) {
+        this.clearCleanupTimer();
+        return;
+      }
+
+      this.dispose();
+      sessions.delete(this.id);
+    }, SESSION_TTL_MS);
   }
+
+  private clearCleanupTimer() {
+    if (!this.#cleanupTimer) {
+      return;
+    }
+
+    clearTimeout(this.#cleanupTimer);
+    this.#cleanupTimer = null;
+  }
+
+  private sendSnapshotTo(socket: WebSocket, paneId: PaneId) {
+    const pane = this.#panes[paneId];
+
+    this.sendTo(socket, {
+      type: "snapshot",
+      paneId,
+      data: pane.history,
+      state: pane.status.state,
+      exitCode: pane.status.exitCode,
+      signal: pane.status.signal,
+    });
+  }
+
+  private broadcast(message: ServerMessage) {
+    for (const socket of this.#sockets) {
+      this.sendTo(socket, message);
+    }
+  }
+
+  private sendTo(socket: WebSocket, message: ServerMessage) {
+    if (socket.readyState !== socket.OPEN) {
+      return;
+    }
+
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function resolveSessionId(rawUrl: string | undefined) {
+  const url = new URL(rawUrl ?? "/", "http://localhost");
+  const sessionId = url.searchParams.get("sessionId");
+
+  if (sessionId && /^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
+    return sessionId;
+  }
+
+  return randomUUID();
 }
 
 const app = express();
@@ -195,6 +357,7 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     cwd: ROOT_DIR,
     panes: PANES.length,
+    sessions: sessions.size,
   });
 });
 
@@ -205,9 +368,16 @@ if (existsSync(DIST_INDEX)) {
   });
 }
 
-wss.on("connection", (socket) => {
-  const session = new BrowserTmuxSession(socket);
-  session.start();
+wss.on("connection", (socket, request) => {
+  const sessionId = resolveSessionId(request.url);
+  let session = sessions.get(sessionId);
+
+  if (!session) {
+    session = new PersistentBrowserTmuxSession(sessionId);
+    sessions.set(sessionId, session);
+  }
+
+  session.attach(socket);
 
   socket.on("message", (value, isBinary) => {
     if (isBinary) {
@@ -218,7 +388,7 @@ wss.on("connection", (socket) => {
   });
 
   socket.on("close", () => {
-    session.dispose();
+    session.detach(socket);
   });
 });
 
