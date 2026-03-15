@@ -1,0 +1,22 @@
+services:
+  browser:
+    image: selenium/standalone-chromium:4.39.0-20251212
+    container_name: browser-tmux-chromium
+    shm_size: 2gb
+    environment:
+      SE_VNC_NO_PASSWORD: "true"
+      SE_BROWSER_ARGS_REMOTE_DEBUG_PORT: "--remote-debugging-port=9222"
+      SE_BROWSER_ARGS_REMOTE_DEBUG_ADDRESS: "--remote-debugging-address=0.0.0.0"
+      SE_BROWSER_ARGS_USER_DATA_DIR: "--user-data-dir=/tmp/chrome-debug"
+      SE_BROWSER_ARGS_NO_FIRST_RUN: "--no-first-run"
+      SE_BROWSER_ARGS_NO_DEFAULT_BROWSER_CHECK: "--no-default-browser-check"
+    ports:
+      - "4444:4444"
+      - "5900:5900"
+      - "7900:7900"
+      - "9222:9222"
+    tmpfs:
+      - /tmp:size=2147483648,exec
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
