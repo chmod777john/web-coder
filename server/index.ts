@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,8 +17,13 @@ const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_DIR = resolve(ROOT_DIR, "dist");
 const DIST_INDEX = join(DIST_DIR, "index.html");
 const PORT = Number(process.env.PORT ?? 3001);
-const HISTORY_LIMIT = 200_000;
+const RUNS_ROOT = resolve("/workspaces", "codex-runs");
+const HISTORY_LIMIT = 250_000;
 const SESSION_TTL_MS = 30 * 60 * 1_000;
+const PREVIEW_PORT_START = 4100;
+const PREVIEW_PORT_END = 4899;
+const CODEX_HOME = resolve(process.env.CODEX_HOME ?? join(homedir(), ".codex"));
+const CODEX_CONFIG_PATH = join(CODEX_HOME, "config.toml");
 
 type PaneStatus = {
   state: "live" | "exited";
@@ -31,6 +39,15 @@ type PaneRuntime = {
   status: PaneStatus;
 };
 
+type BuildSessionConfig = {
+  id: string;
+  previewPort: number;
+  userPrompt: string;
+  workspaceDir: string;
+};
+
+let projectTrustWriteQueue = Promise.resolve();
+
 function resolveShell() {
   if (process.platform === "win32") {
     return process.env.COMSPEC ?? "powershell.exe";
@@ -41,6 +58,67 @@ function resolveShell() {
   }
 
   return existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
+}
+
+function shellEscape(value: string) {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function tomlEscape(value: string) {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function upsertProjectTrust(config: string, projectPath: string) {
+  const header = `[projects."${tomlEscape(projectPath)}"]`;
+  const trustLine = 'trust_level = "trusted"';
+  const sectionPattern = new RegExp(
+    `(^|\\n)${escapeRegExp(header)}\\n([\\s\\S]*?)(?=\\n\\[[^\\n]+\\]|$)`,
+  );
+  const match = config.match(sectionPattern);
+
+  if (!match) {
+    const prefix = config.trimEnd();
+    return `${prefix}${prefix ? "\n\n" : ""}${header}\n${trustLine}\n`;
+  }
+
+  const sectionPrefix = match[1] ?? "";
+  const sectionBody = match[2] ?? "";
+  const nextBody = /(^|\n)trust_level\s*=\s*".*?"(?=\n|$)/.test(sectionBody)
+    ? sectionBody.replace(/(^|\n)trust_level\s*=\s*".*?"(?=\n|$)/, `$1${trustLine}`)
+    : `${trustLine}\n${sectionBody.replace(/^\n+/, "")}`;
+
+  return config.replace(sectionPattern, `${sectionPrefix}${header}\n${nextBody}`);
+}
+
+async function markProjectTrusted(projectPath: string) {
+  const work = async () => {
+    mkdirSync(CODEX_HOME, { recursive: true });
+
+    let currentConfig = "";
+    try {
+      currentConfig = await readFile(CODEX_CONFIG_PATH, "utf8");
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+
+    const nextConfig = upsertProjectTrust(currentConfig, projectPath);
+    if (nextConfig !== currentConfig) {
+      await writeFile(CODEX_CONFIG_PATH, nextConfig, "utf8");
+    }
+  };
+
+  const pending = projectTrustWriteQueue.then(work, work);
+  projectTrustWriteQueue = pending.then(
+    () => undefined,
+    () => undefined,
+  );
+  await pending;
 }
 
 function isPaneId(value: unknown): value is PaneId {
@@ -93,42 +171,98 @@ function appendHistory(history: string, chunk: string) {
   return next.slice(next.length - HISTORY_LIMIT);
 }
 
-const sessions = new Map<string, PersistentBrowserTmuxSession>();
+function composeAgentPrompt(userPrompt: string, workspaceDir: string, previewPort: number) {
+  return [
+    "Build a runnable web app for the user.",
+    "",
+    "User request:",
+    userPrompt,
+    "",
+    "Technical constraints:",
+    `- Work only inside ${workspaceDir}.`,
+    "- Create the project from scratch if needed.",
+    "- Use Bun for package management.",
+    "- Use Vite + React + TypeScript unless the request strongly requires something else.",
+    `- Run the app dev server on port ${previewPort}.`,
+    "- Bind the dev server to 0.0.0.0 so it is reachable from the browser preview.",
+    "- Keep the dev server running once the first working version is ready.",
+    "- Make practical implementation choices and move forward without asking unnecessary questions.",
+    "",
+    "Start now.",
+  ].join("\n");
+}
 
-class PersistentBrowserTmuxSession {
-  readonly #panes: Record<PaneId, PaneRuntime>;
+async function canListenOnPort(port: number) {
+  return new Promise<boolean>((resolve) => {
+    const probe = createNetServer();
+
+    probe.once("error", () => {
+      resolve(false);
+    });
+
+    probe.once("listening", () => {
+      probe.close(() => {
+        resolve(true);
+      });
+    });
+
+    probe.listen(port, "0.0.0.0");
+  });
+}
+
+async function allocatePreviewPort() {
+  for (let port = PREVIEW_PORT_START; port <= PREVIEW_PORT_END; port += 1) {
+    const free = await canListenOnPort(port);
+
+    if (!free) {
+      continue;
+    }
+
+    const inUse = Array.from(sessions.values()).some((session) => session.previewPort === port);
+    if (!inUse) {
+      return port;
+    }
+  }
+
+  throw new Error("No preview port available.");
+}
+
+const sessions = new Map<string, BuildSession>();
+
+class BuildSession {
+  readonly #pane = createPaneRuntime();
   readonly #shell = resolveShell();
   readonly #sockets = new Set<WebSocket>();
   #cleanupTimer: NodeJS.Timeout | null = null;
 
-  constructor(readonly id: string) {
-    this.#panes = {
-      workspace: createPaneRuntime(),
-      server: createPaneRuntime(),
-      scratch: createPaneRuntime(),
-    };
+  constructor(readonly config: BuildSessionConfig) {
+    mkdirSync(config.workspaceDir, { recursive: true });
+    this.spawnPane("agent");
+  }
 
-    for (const pane of PANES) {
-      this.spawnPane(pane.id);
-    }
+  get id() {
+    return this.config.id;
+  }
+
+  get previewPort() {
+    return this.config.previewPort;
   }
 
   attach(socket: WebSocket) {
     this.clearCleanupTimer();
+    this.#sockets.add(socket);
 
     this.sendTo(socket, {
       type: "session",
-      sessionId: this.id,
+      sessionId: this.config.id,
       panes: PANES,
-      cwd: ROOT_DIR,
+      cwd: this.config.workspaceDir,
+      previewPort: this.config.previewPort,
       shell: this.#shell,
+      workspaceDir: this.config.workspaceDir,
     });
 
-    for (const pane of PANES) {
-      this.sendSnapshotTo(socket, pane.id);
-    }
-
-    this.#sockets.add(socket);
+    this.sendSnapshotTo(socket);
   }
 
   detach(socket: WebSocket) {
@@ -137,6 +271,13 @@ class PersistentBrowserTmuxSession {
     if (this.#sockets.size === 0) {
       this.scheduleCleanup();
     }
+  }
+
+  dispose() {
+    this.clearCleanupTimer();
+    this.#pane.pty?.kill();
+    this.#pane.pty = null;
+    this.#sockets.clear();
   }
 
   handleMessage(raw: string) {
@@ -162,55 +303,41 @@ class PersistentBrowserTmuxSession {
 
     switch (payload.type) {
       case "input": {
-        this.#panes[payload.paneId].pty?.write(payload.data);
+        this.#pane.pty?.write(payload.data);
         return;
       }
       case "resize": {
-        const pane = this.#panes[payload.paneId];
-        pane.cols = Math.max(40, Math.floor(payload.cols));
-        pane.rows = Math.max(10, Math.floor(payload.rows));
-        pane.pty?.resize(pane.cols, pane.rows);
+        this.#pane.cols = Math.max(40, Math.floor(payload.cols));
+        this.#pane.rows = Math.max(10, Math.floor(payload.rows));
+        this.#pane.pty?.resize(this.#pane.cols, this.#pane.rows);
         return;
       }
       case "restart": {
-        this.restartPane(payload.paneId);
+        this.restartPane();
       }
     }
   }
 
-  dispose() {
-    this.clearCleanupTimer();
-
-    for (const pane of Object.values(this.#panes)) {
-      pane.pty?.kill();
-      pane.pty = null;
-    }
-
-    this.#sockets.clear();
-  }
-
-  private restartPane(paneId: PaneId) {
-    const pane = this.#panes[paneId];
-    const current = pane.pty;
+  private restartPane() {
+    const current = this.#pane.pty;
 
     if (current) {
-      pane.pty = null;
+      this.#pane.pty = null;
       current.kill();
     }
 
-    this.spawnPane(paneId);
+    this.spawnPane("agent");
   }
 
   private spawnPane(paneId: PaneId) {
-    const pane = this.#panes[paneId];
     const shellArgs = process.platform === "win32" ? [] : ["-i"];
 
     try {
       const pty = spawn(this.#shell, shellArgs, {
         name: "xterm-256color",
-        cols: pane.cols,
-        rows: pane.rows,
-        cwd: ROOT_DIR,
+        cols: this.#pane.cols,
+        rows: this.#pane.rows,
+        cwd: this.config.workspaceDir,
         env: {
           ...process.env,
           COLORTERM: "truecolor",
@@ -218,8 +345,8 @@ class PersistentBrowserTmuxSession {
         },
       });
 
-      pane.pty = pty;
-      pane.status = {
+      this.#pane.pty = pty;
+      this.#pane.status = {
         state: "live",
         exitCode: null,
         signal: null,
@@ -233,12 +360,20 @@ class PersistentBrowserTmuxSession {
         signal: null,
       });
 
-      pty.onData((data) => {
-        if (this.#panes[paneId].pty !== pty) {
+      setTimeout(() => {
+        if (this.#pane.pty !== pty) {
           return;
         }
 
-        pane.history = appendHistory(pane.history, data);
+        pty.write(`${this.createBootstrapCommand()}\r`);
+      }, 250);
+
+      pty.onData((data) => {
+        if (this.#pane.pty !== pty) {
+          return;
+        }
+
+        this.#pane.history = appendHistory(this.#pane.history, data);
         this.broadcast({
           type: "output",
           paneId,
@@ -247,12 +382,12 @@ class PersistentBrowserTmuxSession {
       });
 
       pty.onExit(({ exitCode, signal }) => {
-        if (this.#panes[paneId].pty !== pty) {
+        if (this.#pane.pty !== pty) {
           return;
         }
 
-        pane.pty = null;
-        pane.status = {
+        this.#pane.pty = null;
+        this.#pane.status = {
           state: "exited",
           exitCode: exitCode ?? null,
           signal: signal ?? null,
@@ -267,8 +402,8 @@ class PersistentBrowserTmuxSession {
         });
       });
     } catch (error) {
-      pane.pty = null;
-      pane.status = {
+      this.#pane.pty = null;
+      this.#pane.status = {
         state: "exited",
         exitCode: 1,
         signal: null,
@@ -279,6 +414,30 @@ class PersistentBrowserTmuxSession {
         message: error instanceof Error ? error.message : "Failed to spawn shell.",
       });
     }
+  }
+
+  private createBootstrapCommand() {
+    const prompt = composeAgentPrompt(
+      this.config.userPrompt,
+      this.config.workspaceDir,
+      this.config.previewPort,
+    );
+
+    return [
+      `cd ${shellEscape(this.config.workspaceDir)}`,
+      `codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -C ${shellEscape(this.config.workspaceDir)} ${shellEscape(prompt)}`,
+    ].join(" && ");
+  }
+
+  private sendSnapshotTo(socket: WebSocket) {
+    this.sendTo(socket, {
+      type: "snapshot",
+      paneId: "agent",
+      data: this.#pane.history,
+      state: this.#pane.status.state,
+      exitCode: this.#pane.status.exitCode,
+      signal: this.#pane.status.signal,
+    });
   }
 
   private scheduleCleanup() {
@@ -293,7 +452,7 @@ class PersistentBrowserTmuxSession {
       }
 
       this.dispose();
-      sessions.delete(this.id);
+      sessions.delete(this.config.id);
     }, SESSION_TTL_MS);
   }
 
@@ -304,19 +463,6 @@ class PersistentBrowserTmuxSession {
 
     clearTimeout(this.#cleanupTimer);
     this.#cleanupTimer = null;
-  }
-
-  private sendSnapshotTo(socket: WebSocket, paneId: PaneId) {
-    const pane = this.#panes[paneId];
-
-    this.sendTo(socket, {
-      type: "snapshot",
-      paneId,
-      data: pane.history,
-      state: pane.status.state,
-      exitCode: pane.status.exitCode,
-      signal: pane.status.signal,
-    });
   }
 
   private broadcast(message: ServerMessage) {
@@ -334,29 +480,71 @@ class PersistentBrowserTmuxSession {
   }
 }
 
-function resolveSessionId(rawUrl: string | undefined) {
-  const url = new URL(rawUrl ?? "/", "http://localhost");
-  const sessionId = url.searchParams.get("sessionId");
-
-  if (sessionId && /^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) {
-    return sessionId;
-  }
-
-  return randomUUID();
-}
-
 const app = express();
+app.use(express.json());
+
 const server = createServer(app);
 const wss = new WebSocketServer({
   server,
   path: "/ws",
 });
 
+app.post("/api/build-sessions", async (req, res) => {
+  const prompt =
+    typeof req.body?.prompt === "string"
+      ? req.body.prompt.trim()
+      : "";
+
+  if (!prompt) {
+    res.status(400).json({
+      error: "Prompt is required.",
+    });
+    return;
+  }
+
+  const sessionId = randomUUID();
+  const previewPort = await allocatePreviewPort();
+  const workspaceDir = resolve(RUNS_ROOT, sessionId);
+
+  await markProjectTrusted(workspaceDir);
+
+  const session = new BuildSession({
+    id: sessionId,
+    previewPort,
+    userPrompt: prompt,
+    workspaceDir,
+  });
+
+  sessions.set(sessionId, session);
+
+  res.status(201).json({
+    ok: true,
+    previewPort,
+    sessionId,
+    workspaceDir,
+  });
+});
+
+app.get("/api/build-sessions/:sessionId", (req, res) => {
+  const session = sessions.get(req.params.sessionId);
+
+  if (!session) {
+    res.status(404).json({
+      error: "Session not found.",
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    previewPort: session.previewPort,
+    sessionId: session.id,
+  });
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    cwd: ROOT_DIR,
-    panes: PANES.length,
     sessions: sessions.size,
   });
 });
@@ -369,12 +557,19 @@ if (existsSync(DIST_INDEX)) {
 }
 
 wss.on("connection", (socket, request) => {
-  const sessionId = resolveSessionId(request.url);
-  let session = sessions.get(sessionId);
+  const url = new URL(request.url ?? "/", "http://localhost");
+  const sessionId = url.searchParams.get("sessionId");
+
+  if (!sessionId) {
+    socket.close(4400, "Missing sessionId");
+    return;
+  }
+
+  const session = sessions.get(sessionId);
 
   if (!session) {
-    session = new PersistentBrowserTmuxSession(sessionId);
-    sessions.set(sessionId, session);
+    socket.close(4404, "Session not found");
+    return;
   }
 
   session.attach(socket);

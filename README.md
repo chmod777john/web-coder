@@ -1,6 +1,12 @@
 # Browser Tmux
 
-一个在浏览器里展示三窗格 tmux 风格界面的 Web 应用。每个窗格都连接到真实的本地 PTY，会在项目目录里启动交互式 shell，不是静态文本模拟。
+一个让用户用自然语言启动 `codex` 构建任务的 Web 应用。
+
+- 首屏是需求输入框。
+- 提交后，后端会在 `/workspaces/codex-runs/<sessionId>` 创建独立 workspace。
+- 然后自动启动一个 `codex` 交互会话，并把它接到页面左侧终端。
+- 右侧是预览窗口，目标是承载 `codex` 生成应用的 dev server。
+- 浏览器刷新后会回到同一个构建会话，并恢复已有终端历史。
 
 ## 开发
 
@@ -11,6 +17,29 @@ bun run dev
 
 前端默认跑在 `http://localhost:5173`，后端 PTY/WebSocket 服务跑在 `http://localhost:3001`。
 
+## 当前架构
+
+- 后端: `express + ws + node-pty`
+- 前端: `react + vite + xterm.js`
+- 构建会话接口:
+  - `POST /api/build-sessions`
+  - `GET /api/build-sessions/:sessionId`
+  - `GET /api/health`
+- WebSocket:
+  - `GET /ws?sessionId=<id>`
+
+创建构建会话时，服务端会：
+
+- 分配一个预览端口，范围是 `4100..4899`
+- 自动把该 workspace 写入 `~/.codex/config.toml` 的 trusted projects，避免首次 trust prompt 卡住流程
+- 自动启动 `codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen`
+- 给 `codex` 注入一段固定技术约束：
+  - 仅在该 workspace 下工作
+  - 使用 Bun
+  - 优先使用 `Vite + React + TypeScript`
+  - dev server 绑定 `0.0.0.0`
+  - 使用分配到的预览端口
+
 ## 生产构建
 
 ```bash
@@ -20,10 +49,11 @@ bun run start
 
 ## 说明
 
-- 三个窗格分别提供独立 shell，会话目录都是当前项目根目录。
-- 如果某个 shell 退出，可以在对应窗格右上角点击 `restart` 重新拉起。
-- 当前实现是“tmux 风格 UI + 真实 PTY 后端”。如果你后面要改成直接桥接真实 `tmux` 会话，可以在现有 WebSocket 协议上继续扩展。
-- 同一个浏览器里刷新页面时，会自动重连到同一组后端 PTY，并回放已有终端历史；前提是后端服务还在运行，且浏览器没有清掉 localStorage。
+- 当前界面是「单个 codex 终端 + 右侧预览」而不是旧版三窗格。
+- 点击终端右上角 `restart` 会重新拉起当前 `codex` 会话。
+- 点击 `new task` 会清掉当前前端会话并回到需求输入页。
+- 同一个浏览器里刷新页面时，会自动重连到同一个后端 PTY，并回放已有终端历史；前提是后端服务还在运行，且浏览器没有清掉 localStorage。
+- 构建会话在没有浏览器连接后会保留 30 分钟，之后自动清理。
 - 页面会暴露一个轻量调试桥 `window.__browserTmux`，便于在浏览器 DevTools 或自动化脚本里直接发送输入、读取窗格文本和触发重启。
 
 ## 本地隔离浏览器栈
@@ -66,5 +96,3 @@ AGENT_BROWSER_STREAM_PORT=9223 ./scripts/agent-browser-cdp.sh open https://examp
 ### 说明
 
 - 这套 Selenium 镜像里，Chromium 的真实 CDP 端口通常由 WebDriver 以随机调试端口拉起；最稳定的接入方式是走 Selenium 暴露的 `se:cdp` WebSocket，而不是假设固定 `9222`。
-
-This project was created using `bun init` in bun v1.3.9. [Bun](https://bun.com) is a fast all-in-one JavaScript runtime.

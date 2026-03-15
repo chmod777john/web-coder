@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
 
 import { TerminalPane, type TerminalHandle } from "./components/TerminalPane";
 import { PANES, type PaneId, type ServerMessage } from "../shared/protocol";
 
-type ConnectionState = "connecting" | "connected" | "disconnected";
+type ConnectionState = "idle" | "connecting" | "connected" | "disconnected";
 
 type PaneRuntime = {
   exitCode: number | null;
@@ -12,14 +13,16 @@ type PaneRuntime = {
 };
 
 type BrowserTmuxDebugApi = {
+  clearSession: () => void;
   getPaneText: (paneId: PaneId) => string;
   getState: () => {
-    activePane: PaneId;
     connectionState: ConnectionState;
     cwd: string;
+    previewPort: number | null;
     runtime: Record<PaneId, PaneRuntime>;
-    sessionId: string;
+    sessionId: string | null;
     shell: string;
+    workspaceDir: string;
   };
   restartPane: (paneId: PaneId) => void;
   sendInput: (paneId: PaneId, data: string) => void;
@@ -31,21 +34,11 @@ declare global {
   }
 }
 
-const SESSION_STORAGE_KEY = "browser-tmux/session-id";
+const SESSION_STORAGE_KEY = "browser-tmux/build-session-id";
 
 function createInitialRuntime(): Record<PaneId, PaneRuntime> {
   return {
-    workspace: {
-      state: "booting",
-      exitCode: null,
-      signal: null,
-    },
-    server: {
-      state: "booting",
-      exitCode: null,
-      signal: null,
-    },
-    scratch: {
+    agent: {
       state: "booting",
       exitCode: null,
       signal: null,
@@ -55,55 +48,33 @@ function createInitialRuntime(): Record<PaneId, PaneRuntime> {
 
 function createPendingOutputBuffer(): Record<PaneId, string[]> {
   return {
-    workspace: [],
-    server: [],
-    scratch: [],
+    agent: [],
   };
 }
 
 function createPendingSnapshotBuffer(): Record<PaneId, string | null> {
   return {
-    workspace: null,
-    server: null,
-    scratch: null,
+    agent: null,
   };
 }
 
-function createSessionId() {
-  if (window.crypto?.randomUUID) {
-    return window.crypto.randomUUID();
+function readStoredSessionId() {
+  try {
+    return window.localStorage.getItem(SESSION_STORAGE_KEY);
+  } catch {
+    return null;
   }
-
-  if (window.crypto?.getRandomValues) {
-    const bytes = new Uint8Array(16);
-    window.crypto.getRandomValues(bytes);
-    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  }
-
-  return `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function getOrCreateSessionId() {
+function persistSessionId(sessionId: string | null) {
   try {
-    const stored = window.localStorage.getItem(SESSION_STORAGE_KEY);
-
-    if (stored) {
-      return stored;
+    if (sessionId) {
+      window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+    } else {
+      window.localStorage.removeItem(SESSION_STORAGE_KEY);
     }
-
-    const next = createSessionId();
-    window.localStorage.setItem(SESSION_STORAGE_KEY, next);
-    return next;
   } catch {
-    return createSessionId();
-  }
-}
-
-function persistSessionId(sessionId: string) {
-  try {
-    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
-  } catch {
-    // Ignore storage failures and keep the in-memory session id.
+    // Ignore storage failures.
   }
 }
 
@@ -114,31 +85,81 @@ function getSocketUrl(sessionId: string) {
   return url.toString();
 }
 
+function buildPreviewUrl(previewPort: number | null) {
+  if (!previewPort) {
+    return "";
+  }
+
+  return `${window.location.protocol}//${window.location.hostname}:${previewPort}`;
+}
+
 export function App() {
-  const sessionIdRef = useRef(getOrCreateSessionId());
+  const pane = PANES[0];
+  const sessionIdRef = useRef<string | null>(readStoredSessionId());
   const terminalsRef = useRef(new Map<PaneId, TerminalHandle>());
   const pendingOutputRef = useRef(createPendingOutputBuffer());
   const pendingSnapshotRef = useRef(createPendingSnapshotBuffer());
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
 
-  const [activePane, setActivePane] = useState<PaneId>("workspace");
-  const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
+  const [prompt, setPrompt] = useState("");
+  const [createError, setCreateError] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
+  const [isPreviewReady, setIsPreviewReady] = useState(false);
+  const [previewRefreshKey, setPreviewRefreshKey] = useState(0);
+  const [connectionState, setConnectionState] = useState<ConnectionState>(
+    sessionIdRef.current ? "connecting" : "idle",
+  );
   const [cwd, setCwd] = useState("");
+  const [previewPort, setPreviewPort] = useState<number | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(sessionIdRef.current);
   const [shell, setShell] = useState("");
-  const [sessionId, setSessionId] = useState(sessionIdRef.current);
+  const [workspaceDir, setWorkspaceDir] = useState("");
   const [runtime, setRuntime] = useState<Record<PaneId, PaneRuntime>>(createInitialRuntime);
 
+  const previewUrl = useMemo(() => buildPreviewUrl(previewPort), [previewPort]);
   const connectionLabel = useMemo(() => {
     switch (connectionState) {
       case "connected":
         return "connected";
       case "disconnected":
         return "reconnecting";
-      default:
+      case "connecting":
         return "connecting";
+      default:
+        return "idle";
     }
   }, [connectionState]);
+
+  const resetClientSessionState = () => {
+    pendingOutputRef.current = createPendingOutputBuffer();
+    pendingSnapshotRef.current = createPendingSnapshotBuffer();
+    setCwd("");
+    setPreviewPort(null);
+    setShell("");
+    setWorkspaceDir("");
+    setRuntime(createInitialRuntime());
+
+    for (const terminal of terminalsRef.current.values()) {
+      terminal.reset();
+    }
+  };
+
+  const clearCurrentSession = () => {
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current);
+    }
+
+    socketRef.current?.close();
+    socketRef.current = null;
+    sessionIdRef.current = null;
+    persistSessionId(null);
+    setSessionId(null);
+    setConnectionState("idle");
+    resetClientSessionState();
+    setPreviewRefreshKey(0);
+    setCreateError("");
+  };
 
   const sendMessage = (message: unknown) => {
     if (socketRef.current?.readyState !== WebSocket.OPEN) {
@@ -173,6 +194,10 @@ export function App() {
   };
 
   useEffect(() => {
+    if (!sessionId) {
+      return;
+    }
+
     let stopped = false;
 
     const writeToPane = (paneId: PaneId, data: string) => {
@@ -186,24 +211,22 @@ export function App() {
       terminal.write(data);
     };
 
-    const syncTerminalSizes = () => {
-      for (const pane of PANES) {
-        const terminal = terminalsRef.current.get(pane.id);
+    const syncTerminalSize = () => {
+      const terminal = terminalsRef.current.get("agent");
 
-        if (!terminal) {
-          continue;
-        }
-
-        terminal.fit();
-
-        const { cols, rows } = terminal.getSize();
-        sendMessage({
-          type: "resize",
-          paneId: pane.id,
-          cols,
-          rows,
-        });
+      if (!terminal) {
+        return;
       }
+
+      terminal.fit();
+
+      const { cols, rows } = terminal.getSize();
+      sendMessage({
+        type: "resize",
+        paneId: "agent",
+        cols,
+        rows,
+      });
     };
 
     const handleMessage = (message: ServerMessage) => {
@@ -213,16 +236,16 @@ export function App() {
           persistSessionId(message.sessionId);
           setSessionId(message.sessionId);
           setCwd(message.cwd);
+          setPreviewPort(message.previewPort);
           setShell(message.shell);
+          setWorkspaceDir(message.workspaceDir);
           setRuntime(createInitialRuntime());
           pendingOutputRef.current = createPendingOutputBuffer();
           pendingSnapshotRef.current = createPendingSnapshotBuffer();
 
-          for (const pane of PANES) {
-            terminalsRef.current.get(pane.id)?.reset();
-          }
+          terminalsRef.current.get("agent")?.reset();
 
-          requestAnimationFrame(syncTerminalSizes);
+          requestAnimationFrame(syncTerminalSize);
           return;
         }
         case "snapshot": {
@@ -266,16 +289,14 @@ export function App() {
           if (message.state === "exited") {
             writeToPane(
               message.paneId,
-              `\r\n\x1b[31m[process exited: code=${message.exitCode ?? "?"}, signal=${message.signal ?? "none"}]\x1b[0m\r\n`,
+              `\r\n\x1b[31m[codex session exited: code=${message.exitCode ?? "?"}, signal=${message.signal ?? "none"}]\x1b[0m\r\n`,
             );
           }
 
           return;
         }
         case "error": {
-          for (const pane of PANES) {
-            writeToPane(pane.id, `\r\n\x1b[33m${message.message}\x1b[0m\r\n`);
-          }
+          writeToPane("agent", `\r\n\x1b[33m${message.message}\x1b[0m\r\n`);
         }
       }
     };
@@ -283,7 +304,7 @@ export function App() {
     const connect = () => {
       setConnectionState("connecting");
 
-      const socket = new WebSocket(getSocketUrl(sessionIdRef.current));
+      const socket = new WebSocket(getSocketUrl(sessionId));
       socketRef.current = socket;
 
       socket.addEventListener("open", () => {
@@ -295,12 +316,21 @@ export function App() {
         handleMessage(message);
       });
 
-      socket.addEventListener("close", () => {
+      socket.addEventListener("close", (event) => {
         if (socketRef.current === socket) {
           socketRef.current = null;
         }
 
         if (stopped) {
+          return;
+        }
+
+        if (sessionIdRef.current !== sessionId) {
+          return;
+        }
+
+        if (event.code === 4400 || event.code === 4404) {
+          clearCurrentSession();
           return;
         }
 
@@ -320,18 +350,61 @@ export function App() {
 
       socketRef.current?.close();
     };
-  }, []);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || !previewUrl) {
+      setIsPreviewReady(false);
+      return;
+    }
+
+    let cancelled = false;
+    let probeTimer: number | null = null;
+
+    const probePreview = async () => {
+      try {
+        await fetch(previewUrl, {
+          cache: "no-store",
+          mode: "no-cors",
+        });
+
+        if (!cancelled) {
+          setIsPreviewReady(true);
+        }
+      } catch {
+        if (cancelled) {
+          return;
+        }
+
+        setIsPreviewReady(false);
+        probeTimer = window.setTimeout(probePreview, 1_500);
+      }
+    };
+
+    setIsPreviewReady(false);
+    probePreview();
+
+    return () => {
+      cancelled = true;
+
+      if (probeTimer) {
+        window.clearTimeout(probeTimer);
+      }
+    };
+  }, [previewRefreshKey, previewUrl, sessionId]);
 
   useEffect(() => {
     window.__browserTmux = {
+      clearSession: clearCurrentSession,
       getPaneText: (paneId) => terminalsRef.current.get(paneId)?.getText() ?? "",
       getState: () => ({
-        activePane,
         connectionState,
         cwd,
+        previewPort,
         runtime,
         sessionId,
         shell,
+        workspaceDir,
       }),
       restartPane: (paneId) => {
         sendMessage({
@@ -351,9 +424,99 @@ export function App() {
     return () => {
       delete window.__browserTmux;
     };
-  }, [activePane, connectionState, cwd, runtime, sessionId, shell]);
+  }, [connectionState, cwd, previewPort, runtime, sessionId, shell, workspaceDir]);
 
-  const activePaneMeta = PANES.find((pane) => pane.id === activePane) ?? PANES[0];
+  const handleCreateSession = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!prompt.trim()) {
+      setCreateError("先写下你想让 codex 做什么。");
+      return;
+    }
+
+    setIsCreating(true);
+    setCreateError("");
+
+    try {
+      const response = await fetch("/api/build-sessions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          prompt: prompt.trim(),
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? "Failed to create build session.");
+      }
+
+      const payload = (await response.json()) as {
+        previewPort: number;
+        sessionId: string;
+        workspaceDir: string;
+      };
+
+      sessionIdRef.current = payload.sessionId;
+      persistSessionId(payload.sessionId);
+      setSessionId(payload.sessionId);
+      setPreviewPort(payload.previewPort);
+      setWorkspaceDir(payload.workspaceDir);
+      setConnectionState("connecting");
+      setPreviewRefreshKey(0);
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : "Failed to create build session.");
+    } finally {
+      setIsCreating(false);
+    }
+  };
+
+  if (!sessionId) {
+    return (
+      <div className="app-shell">
+        <div className="app-shell__backdrop" />
+        <div className="app-shell__inner app-shell__inner--centered">
+          <section className="launcher">
+            <div className="launcher__copy">
+              <p className="eyebrow">codex builder</p>
+              <h1>说出需求，直接生成一个可预览的应用工作台。</h1>
+              <p className="launcher__lede">
+                后端会创建独立 workspace，启动 codex，默认按 Vite + React + TypeScript
+                的方向开始实现，并把 dev server 接到右侧预览窗口。
+              </p>
+            </div>
+
+            <form className="launcher__form" onSubmit={handleCreateSession}>
+              <label className="launcher__label" htmlFor="prompt">
+                你想做什么
+              </label>
+              <textarea
+                className="launcher__textarea"
+                id="prompt"
+                onChange={(event) => {
+                  setPrompt(event.target.value);
+                }}
+                placeholder="例如：做一个面向健身工作室的预约网站，要有课程列表、教练介绍、移动端优先设计。"
+                rows={8}
+                value={prompt}
+              />
+              {createError ? <p className="launcher__error">{createError}</p> : null}
+              <div className="launcher__actions">
+                <button className="launcher__button" disabled={isCreating} type="submit">
+                  {isCreating ? "starting codex..." : "开始构建"}
+                </button>
+                <p className="launcher__hint">
+                  创建后会进入工作台，并自动保留刷新后的终端会话。
+                </p>
+              </div>
+            </form>
+          </section>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -361,8 +524,8 @@ export function App() {
       <div className="app-shell__inner">
         <header className="topbar">
           <div>
-            <p className="eyebrow">browser tmux</p>
-            <h1>Three live terminals, one tmux-style dashboard.</h1>
+            <p className="eyebrow">codex builder</p>
+            <h1>单终端驱动，右侧实时预览。</h1>
           </div>
           <div className="topbar__meta">
             <div className="metric">
@@ -370,21 +533,21 @@ export function App() {
               <strong>{connectionLabel}</strong>
             </div>
             <div className="metric">
-              <span>active</span>
-              <strong>{activePaneMeta.title}</strong>
+              <span>preview</span>
+              <strong>{previewPort ? `:${previewPort}` : "pending"}</strong>
             </div>
             <div className="metric">
-              <span>shell</span>
-              <strong>{shell || "resolving"}</strong>
+              <span>session</span>
+              <strong>{sessionId}</strong>
             </div>
           </div>
         </header>
 
-        <main className="layout">
-          <div className="layout__primary">
+        <main className="workspace">
+          <div className="workspace__terminal">
             <TerminalPane
-              active={activePane === "workspace"}
-              onFocus={setActivePane}
+              active
+              onFocus={() => {}}
               onInput={(paneId, data) => {
                 sendMessage({
                   type: "input",
@@ -407,83 +570,74 @@ export function App() {
                   paneId,
                 });
               }}
-              pane={PANES[0]}
-              runtime={runtime.workspace}
+              pane={pane}
+              runtime={runtime.agent}
             />
           </div>
 
-          <div className="layout__stack">
-            <TerminalPane
-              active={activePane === "server"}
-              onFocus={setActivePane}
-              onInput={(paneId, data) => {
-                sendMessage({
-                  type: "input",
-                  paneId,
-                  data,
-                });
-              }}
-              onReady={handlePaneReady}
-              onResize={(paneId, cols, rows) => {
-                sendMessage({
-                  type: "resize",
-                  paneId,
-                  cols,
-                  rows,
-                });
-              }}
-              onRestart={(paneId) => {
-                sendMessage({
-                  type: "restart",
-                  paneId,
-                });
-              }}
-              pane={PANES[1]}
-              runtime={runtime.server}
-            />
-            <TerminalPane
-              active={activePane === "scratch"}
-              onFocus={setActivePane}
-              onInput={(paneId, data) => {
-                sendMessage({
-                  type: "input",
-                  paneId,
-                  data,
-                });
-              }}
-              onReady={handlePaneReady}
-              onResize={(paneId, cols, rows) => {
-                sendMessage({
-                  type: "resize",
-                  paneId,
-                  cols,
-                  rows,
-                });
-              }}
-              onRestart={(paneId) => {
-                sendMessage({
-                  type: "restart",
-                  paneId,
-                });
-              }}
-              pane={PANES[2]}
-              runtime={runtime.scratch}
-            />
-          </div>
+          <section className="preview">
+            <header className="preview__header">
+              <div>
+                <p className="pane__title">preview</p>
+                <p className="pane__subtitle">
+                  {previewUrl && isPreviewReady
+                    ? previewUrl
+                    : "waiting for the app dev server to come up"}
+                </p>
+              </div>
+              <div className="pane__actions">
+                <button
+                  className="pane__button"
+                  onClick={() => {
+                    setPreviewRefreshKey((value) => value + 1);
+                  }}
+                  type="button"
+                >
+                  reload
+                </button>
+                <button
+                  className="pane__button"
+                  onClick={() => {
+                    clearCurrentSession();
+                  }}
+                  type="button"
+                >
+                  new task
+                </button>
+              </div>
+            </header>
+            <div className="preview__frame-shell">
+              {previewUrl && isPreviewReady ? (
+                <iframe
+                  className="preview__frame"
+                  key={`${previewUrl}-${previewRefreshKey}`}
+                  src={previewUrl}
+                  title="app preview"
+                />
+              ) : (
+                <div className="preview__placeholder">
+                  <strong>Waiting for preview server</strong>
+                  <p>
+                    Codex will start the generated app on the assigned port when it is ready.
+                  </p>
+                </div>
+              )}
+            </div>
+          </section>
         </main>
 
         <footer className="statusbar">
           <div className="statusbar__pill">
-            <span>session</span>
-            <strong>{sessionId}</strong>
+            <span>workspace</span>
+            <strong>{workspaceDir || "preparing"}</strong>
           </div>
           <div className="statusbar__pill">
-            <span>cwd</span>
-            <strong>{cwd || "waiting for server"}</strong>
+            <span>shell</span>
+            <strong>{shell || "resolving"}</strong>
           </div>
           <div className="statusbar__pill">
-            <span>tip</span>
-            <strong>refresh keeps the same shell session</strong>
+            <span>refresh</span>
+            <strong>same session, same terminal history</strong>
           </div>
         </footer>
       </div>

@@ -1,18 +1,8 @@
 export const PANES = [
   {
-    id: "workspace",
-    title: "workspace",
-    subtitle: "project root shell",
-  },
-  {
-    id: "server",
-    title: "server",
-    subtitle: "run the app or watchers",
-  },
-  {
-    id: "scratch",
-    title: "scratch",
-    subtitle: "one-off commands",
+    id: "agent",
+    title: "codex",
+    subtitle: "interactive build session",
   },
 ] as const;
 
@@ -42,7 +32,9 @@ export type ServerMessage =
       sessionId: string;
       panes: readonly PaneDefinition[];
       cwd: string;
+      previewPort: number;
       shell: string;
+      workspaceDir: string;
     }
   | {
       type: "snapshot";
