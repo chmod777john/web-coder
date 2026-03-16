@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
+import { Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 
 import { TerminalPane, type TerminalHandle } from "./components/TerminalPane";
 import { PANES, type PaneId, type ServerMessage } from "../shared/protocol";
@@ -26,6 +27,13 @@ type ProjectSummary = {
   workspaceDir: string;
 };
 
+type BuildSessionPayload = {
+  projectId: string;
+  previewPort: number;
+  sessionId: string;
+  workspaceDir: string;
+};
+
 type BrowserTmuxDebugApi = {
   clearSession: () => void;
   getPaneText: (paneId: PaneId) => string;
@@ -49,9 +57,6 @@ declare global {
   }
 }
 
-const SESSION_STORAGE_KEY = "browser-tmux/build-session-id";
-const NEW_PROJECT_ACTION_ID = "__new__";
-
 function createInitialRuntime(): Record<PaneId, PaneRuntime> {
   return {
     agent: {
@@ -72,26 +77,6 @@ function createPendingSnapshotBuffer(): Record<PaneId, string | null> {
   return {
     agent: null,
   };
-}
-
-function readStoredSessionId() {
-  try {
-    return window.localStorage.getItem(SESSION_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function persistSessionId(sessionId: string | null) {
-  try {
-    if (sessionId) {
-      window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
-    } else {
-      window.localStorage.removeItem(SESSION_STORAGE_KEY);
-    }
-  } catch {
-    // Ignore storage failures.
-  }
 }
 
 function getSocketUrl(sessionId: string) {
@@ -117,33 +102,266 @@ function formatProjectTime(value: string | null) {
   return new Date(value).toLocaleString();
 }
 
-export function App() {
+function buildWorkspacePath(projectId: string, sessionId: string) {
+  return `/projects/${projectId}/sessions/${sessionId}`;
+}
+
+function LauncherPage() {
+  const navigate = useNavigate();
+  const [prompt, setPrompt] = useState("");
+  const [createError, setCreateError] = useState("");
+  const [isCreating, setIsCreating] = useState(false);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectsError, setProjectsError] = useState("");
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [projectActionId, setProjectActionId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadProjects = async () => {
+      setProjectsLoading(true);
+      setProjectsError("");
+
+      try {
+        const response = await fetch("/api/projects");
+
+        if (!response.ok) {
+          const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(payload?.error ?? "Failed to load projects.");
+        }
+
+        const payload = (await response.json()) as {
+          projects: ProjectSummary[];
+        };
+
+        if (!cancelled) {
+          setProjects(payload.projects);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setProjectsError(error instanceof Error ? error.message : "Failed to load projects.");
+        }
+      } finally {
+        if (!cancelled) {
+          setProjectsLoading(false);
+        }
+      }
+    };
+
+    void loadProjects();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const openWorkspace = (payload: BuildSessionPayload) => {
+    navigate(buildWorkspacePath(payload.projectId, payload.sessionId));
+  };
+
+  const handleCreateSession = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!prompt.trim()) {
+      setCreateError("先写下你想让 codex 做什么。");
+      return;
+    }
+
+    setIsCreating(true);
+    setProjectActionId("__new__");
+    setCreateError("");
+
+    try {
+      const response = await fetch("/api/build-sessions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          prompt: prompt.trim(),
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? "Failed to create build session.");
+      }
+
+      openWorkspace((await response.json()) as BuildSessionPayload);
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : "Failed to create build session.");
+    } finally {
+      setIsCreating(false);
+      setProjectActionId(null);
+    }
+  };
+
+  const handleContinueProject = async (project: ProjectSummary) => {
+    setProjectActionId(project.id);
+    setProjectsError("");
+
+    try {
+      if (project.activeSessionId) {
+        navigate(buildWorkspacePath(project.id, project.activeSessionId));
+        return;
+      }
+
+      const response = await fetch("/api/build-sessions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          projectId: project.id,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? "Failed to continue project.");
+      }
+
+      openWorkspace((await response.json()) as BuildSessionPayload);
+    } catch (error) {
+      setProjectsError(error instanceof Error ? error.message : "Failed to continue project.");
+    } finally {
+      setProjectActionId(null);
+    }
+  };
+
+  return (
+    <div className="app-shell">
+      <div className="app-shell__backdrop" />
+      <div className="app-shell__inner app-shell__inner--centered">
+        <section className="launcher">
+          <div className="launcher__copy">
+            <p className="eyebrow">codex builder</p>
+            <h1>说出需求，直接生成一个可预览的应用工作台。</h1>
+            <p className="launcher__lede">
+              根路径现在只负责项目页。工作台会进入独立路由，所以直接访问 `/`
+              不会再自动跳进上一个项目。
+            </p>
+          </div>
+
+          <div className="launcher__rail">
+            <form className="launcher__form" onSubmit={handleCreateSession}>
+              <label className="launcher__label" htmlFor="prompt">
+                新项目需求
+              </label>
+              <textarea
+                className="launcher__textarea"
+                id="prompt"
+                onChange={(event) => {
+                  setPrompt(event.target.value);
+                }}
+                placeholder="例如：做一个面向健身工作室的预约网站，要有课程列表、教练介绍、移动端优先设计。"
+                rows={8}
+                value={prompt}
+              />
+              {createError ? <p className="launcher__error">{createError}</p> : null}
+              <div className="launcher__actions">
+                <button className="launcher__button" disabled={isCreating} type="submit">
+                  {isCreating ? "starting codex..." : "开始新项目"}
+                </button>
+                <p className="launcher__hint">
+                  创建后会跳到独立工作台路由，并自动连接对应 session。
+                </p>
+              </div>
+            </form>
+
+            <section className="project-list">
+              <header className="project-list__header">
+                <div>
+                  <p className="launcher__label">已有项目</p>
+                  <p className="project-list__lede">
+                    服务重启后，这里仍然会保留你的项目入口。
+                  </p>
+                </div>
+              </header>
+
+              {projectsError ? <p className="launcher__error">{projectsError}</p> : null}
+
+              {projectsLoading ? (
+                <p className="project-list__empty">Loading projects...</p>
+              ) : projects.length > 0 ? (
+                <div className="project-list__items">
+                  {projects.map((project) => (
+                    <article className="project-card" key={project.id}>
+                      <div className="project-card__copy">
+                        <div className="project-card__topline">
+                          <p className="project-card__title">{project.title}</p>
+                          <span
+                            className={`project-card__status project-card__status--${project.activeSessionId ? "active" : (project.lastSessionState ?? "idle")}`}
+                          >
+                            {project.activeSessionId
+                              ? "live"
+                              : project.lastSessionState ?? "saved"}
+                          </span>
+                        </div>
+                        <p className="project-card__prompt">{project.initialPrompt}</p>
+                        <p className="project-card__meta">
+                          last opened {formatProjectTime(project.lastOpenedAt)}
+                        </p>
+                        <p className="project-card__path">{project.workspaceDir}</p>
+                      </div>
+
+                      <button
+                        className="launcher__button"
+                        disabled={projectActionId === project.id}
+                        onClick={() => {
+                          void handleContinueProject(project);
+                        }}
+                        type="button"
+                      >
+                        {projectActionId === project.id
+                          ? "opening..."
+                          : project.activeSessionId
+                            ? "继续会话"
+                            : "重新进入"}
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <p className="project-list__empty">
+                  还没有持久化项目。先新建一个任务。
+                </p>
+              )}
+            </section>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function WorkspacePage() {
+  const navigate = useNavigate();
+  const { projectId: routeProjectId, sessionId: routeSessionId } = useParams<{
+    projectId: string;
+    sessionId: string;
+  }>();
+
   const pane = PANES[0];
-  const sessionIdRef = useRef<string | null>(readStoredSessionId());
   const terminalsRef = useRef(new Map<PaneId, TerminalHandle>());
   const pendingOutputRef = useRef(createPendingOutputBuffer());
   const pendingSnapshotRef = useRef(createPendingSnapshotBuffer());
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const sessionIdRef = useRef<string | null>(routeSessionId ?? null);
 
-  const [prompt, setPrompt] = useState("");
-  const [createError, setCreateError] = useState("");
-  const [isCreating, setIsCreating] = useState(false);
-  const [isPreviewReady, setIsPreviewReady] = useState(false);
-  const [previewRefreshKey, setPreviewRefreshKey] = useState(0);
   const [connectionState, setConnectionState] = useState<ConnectionState>(
-    sessionIdRef.current ? "connecting" : "idle",
+    routeSessionId ? "connecting" : "idle",
   );
   const [cwd, setCwd] = useState("");
   const [previewPort, setPreviewPort] = useState<number | null>(null);
-  const [projectId, setProjectId] = useState<string | null>(null);
-  const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [projectsError, setProjectsError] = useState("");
-  const [projectsLoading, setProjectsLoading] = useState(false);
-  const [projectActionId, setProjectActionId] = useState<string | null>(null);
-  const [sessionId, setSessionId] = useState<string | null>(sessionIdRef.current);
+  const [projectId, setProjectId] = useState<string | null>(routeProjectId ?? null);
+  const [sessionId, setSessionId] = useState<string | null>(routeSessionId ?? null);
   const [shell, setShell] = useState("");
   const [workspaceDir, setWorkspaceDir] = useState("");
+  const [isPreviewReady, setIsPreviewReady] = useState(false);
+  const [previewRefreshKey, setPreviewRefreshKey] = useState(0);
   const [runtime, setRuntime] = useState<Record<PaneId, PaneRuntime>>(createInitialRuntime);
 
   const previewUrl = useMemo(() => buildPreviewUrl(previewPort), [previewPort]);
@@ -160,45 +378,7 @@ export function App() {
     }
   }, [connectionState]);
 
-  const resetClientSessionState = () => {
-    pendingOutputRef.current = createPendingOutputBuffer();
-    pendingSnapshotRef.current = createPendingSnapshotBuffer();
-    setCwd("");
-    setPreviewPort(null);
-    setProjectId(null);
-    setShell("");
-    setWorkspaceDir("");
-    setRuntime(createInitialRuntime());
-
-    for (const terminal of terminalsRef.current.values()) {
-      terminal.reset();
-    }
-  };
-
-  const connectToSession = (next: {
-    projectId?: string | null;
-    previewPort?: number | null;
-    sessionId: string;
-    workspaceDir?: string;
-  }) => {
-    if (reconnectTimerRef.current) {
-      window.clearTimeout(reconnectTimerRef.current);
-    }
-
-    resetClientSessionState();
-    sessionIdRef.current = next.sessionId;
-    persistSessionId(next.sessionId);
-    setSessionId(next.sessionId);
-    setProjectId(next.projectId ?? null);
-    setPreviewPort(next.previewPort ?? null);
-    setWorkspaceDir(next.workspaceDir ?? "");
-    setConnectionState("connecting");
-    setPreviewRefreshKey(0);
-    setIsPreviewReady(false);
-    setCreateError("");
-  };
-
-  const clearCurrentSession = () => {
+  const leaveWorkspace = () => {
     if (reconnectTimerRef.current) {
       window.clearTimeout(reconnectTimerRef.current);
     }
@@ -206,14 +386,21 @@ export function App() {
     socketRef.current?.close();
     socketRef.current = null;
     sessionIdRef.current = null;
-    persistSessionId(null);
-    setSessionId(null);
-    setConnectionState("idle");
-    setPrompt("");
-    setProjectActionId(null);
-    setCreateError("");
-    resetClientSessionState();
-    setPreviewRefreshKey(0);
+    navigate("/", { replace: true });
+  };
+
+  const resetClientSessionState = () => {
+    pendingOutputRef.current = createPendingOutputBuffer();
+    pendingSnapshotRef.current = createPendingSnapshotBuffer();
+    setCwd("");
+    setPreviewPort(null);
+    setShell("");
+    setWorkspaceDir("");
+    setRuntime(createInitialRuntime());
+
+    for (const terminal of terminalsRef.current.values()) {
+      terminal.reset();
+    }
   };
 
   const sendMessage = (message: unknown) => {
@@ -247,6 +434,20 @@ export function App() {
       pendingOutputRef.current[paneId] = [];
     }
   };
+
+  useEffect(() => {
+    if (!routeSessionId || !routeProjectId) {
+      return;
+    }
+
+    sessionIdRef.current = routeSessionId;
+    setSessionId(routeSessionId);
+    setProjectId(routeProjectId);
+    setConnectionState("connecting");
+    setPreviewRefreshKey(0);
+    setIsPreviewReady(false);
+    resetClientSessionState();
+  }, [routeProjectId, routeSessionId]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -288,7 +489,6 @@ export function App() {
       switch (message.type) {
         case "session": {
           sessionIdRef.current = message.sessionId;
-          persistSessionId(message.sessionId);
           setSessionId(message.sessionId);
           setProjectId(message.projectId);
           setCwd(message.cwd);
@@ -386,7 +586,7 @@ export function App() {
         }
 
         if (event.code === 4400 || event.code === 4404) {
-          clearCurrentSession();
+          leaveWorkspace();
           return;
         }
 
@@ -450,52 +650,8 @@ export function App() {
   }, [previewRefreshKey, previewUrl, sessionId]);
 
   useEffect(() => {
-    if (sessionId) {
-      return;
-    }
-
-    let cancelled = false;
-
-    const loadProjects = async () => {
-      setProjectsLoading(true);
-      setProjectsError("");
-
-      try {
-        const response = await fetch("/api/projects");
-
-        if (!response.ok) {
-          const payload = (await response.json().catch(() => null)) as { error?: string } | null;
-          throw new Error(payload?.error ?? "Failed to load projects.");
-        }
-
-        const payload = (await response.json()) as {
-          projects: ProjectSummary[];
-        };
-
-        if (!cancelled) {
-          setProjects(payload.projects);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setProjectsError(error instanceof Error ? error.message : "Failed to load projects.");
-        }
-      } finally {
-        if (!cancelled) {
-          setProjectsLoading(false);
-        }
-      }
-    };
-
-    void loadProjects();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId]);
-
-  useEffect(() => {
     window.__browserTmux = {
-      clearSession: clearCurrentSession,
+      clearSession: leaveWorkspace,
       getPaneText: (paneId) => terminalsRef.current.get(paneId)?.getText() ?? "",
       getState: () => ({
         connectionState,
@@ -527,203 +683,8 @@ export function App() {
     };
   }, [connectionState, cwd, previewPort, projectId, runtime, sessionId, shell, workspaceDir]);
 
-  const handleCreateSession = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-
-    if (!prompt.trim()) {
-      setCreateError("先写下你想让 codex 做什么。");
-      return;
-    }
-
-    setIsCreating(true);
-    setProjectActionId(NEW_PROJECT_ACTION_ID);
-    setCreateError("");
-
-    try {
-      const response = await fetch("/api/build-sessions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          prompt: prompt.trim(),
-        }),
-      });
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(payload?.error ?? "Failed to create build session.");
-      }
-
-      const payload = (await response.json()) as {
-        projectId: string;
-        previewPort: number;
-        sessionId: string;
-        workspaceDir: string;
-      };
-
-      connectToSession(payload);
-    } catch (error) {
-      setCreateError(error instanceof Error ? error.message : "Failed to create build session.");
-    } finally {
-      setIsCreating(false);
-      setProjectActionId(null);
-    }
-  };
-
-  const handleContinueProject = async (project: ProjectSummary) => {
-    setProjectActionId(project.id);
-    setProjectsError("");
-
-    try {
-      if (project.activeSessionId) {
-        connectToSession({
-          projectId: project.id,
-          sessionId: project.activeSessionId,
-          workspaceDir: project.workspaceDir,
-        });
-        return;
-      }
-
-      const response = await fetch("/api/build-sessions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          projectId: project.id,
-        }),
-      });
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(payload?.error ?? "Failed to continue project.");
-      }
-
-      const payload = (await response.json()) as {
-        projectId: string;
-        previewPort: number;
-        sessionId: string;
-        workspaceDir: string;
-      };
-
-      connectToSession(payload);
-    } catch (error) {
-      setProjectsError(error instanceof Error ? error.message : "Failed to continue project.");
-    } finally {
-      setProjectActionId(null);
-    }
-  };
-
-  if (!sessionId) {
-    return (
-      <div className="app-shell">
-        <div className="app-shell__backdrop" />
-        <div className="app-shell__inner app-shell__inner--centered">
-          <section className="launcher">
-            <div className="launcher__copy">
-              <p className="eyebrow">codex builder</p>
-              <h1>说出需求，直接生成一个可预览的应用工作台。</h1>
-              <p className="launcher__lede">
-                后端会为每个项目保留独立 workspace，并把项目元数据持久化到 Postgres。
-                你可以新建任务，也可以回到已有项目继续构建。
-              </p>
-            </div>
-
-            <div className="launcher__rail">
-              <form className="launcher__form" onSubmit={handleCreateSession}>
-                <label className="launcher__label" htmlFor="prompt">
-                  新项目需求
-                </label>
-                <textarea
-                  className="launcher__textarea"
-                  id="prompt"
-                  onChange={(event) => {
-                    setPrompt(event.target.value);
-                  }}
-                  placeholder="例如：做一个面向健身工作室的预约网站，要有课程列表、教练介绍、移动端优先设计。"
-                  rows={8}
-                  value={prompt}
-                />
-                {createError ? <p className="launcher__error">{createError}</p> : null}
-                <div className="launcher__actions">
-                  <button
-                    className="launcher__button"
-                    disabled={isCreating}
-                    type="submit"
-                  >
-                    {isCreating ? "starting codex..." : "开始新项目"}
-                  </button>
-                  <p className="launcher__hint">
-                    创建后会进入工作台，并自动保留刷新后的终端会话。
-                  </p>
-                </div>
-              </form>
-
-              <section className="project-list">
-                <header className="project-list__header">
-                  <div>
-                    <p className="launcher__label">已有项目</p>
-                    <p className="project-list__lede">
-                      服务重启后，这里仍然会保留你的项目入口。
-                    </p>
-                  </div>
-                </header>
-
-                {projectsError ? <p className="launcher__error">{projectsError}</p> : null}
-
-                {projectsLoading ? (
-                  <p className="project-list__empty">Loading projects...</p>
-                ) : projects.length > 0 ? (
-                  <div className="project-list__items">
-                    {projects.map((project) => (
-                      <article className="project-card" key={project.id}>
-                        <div className="project-card__copy">
-                          <div className="project-card__topline">
-                            <p className="project-card__title">{project.title}</p>
-                            <span
-                              className={`project-card__status project-card__status--${project.activeSessionId ? "active" : (project.lastSessionState ?? "idle")}`}
-                            >
-                              {project.activeSessionId
-                                ? "live"
-                                : project.lastSessionState ?? "saved"}
-                            </span>
-                          </div>
-                          <p className="project-card__prompt">{project.initialPrompt}</p>
-                          <p className="project-card__meta">
-                            last opened {formatProjectTime(project.lastOpenedAt)}
-                          </p>
-                          <p className="project-card__path">{project.workspaceDir}</p>
-                        </div>
-
-                        <button
-                          className="launcher__button"
-                          disabled={projectActionId === project.id}
-                          onClick={() => {
-                            void handleContinueProject(project);
-                          }}
-                          type="button"
-                        >
-                          {projectActionId === project.id
-                            ? "opening..."
-                            : project.activeSessionId
-                              ? "继续会话"
-                              : "重新进入"}
-                        </button>
-                      </article>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="project-list__empty">
-                    还没有持久化项目。先新建一个任务。
-                  </p>
-                )}
-              </section>
-            </div>
-          </section>
-        </div>
-      </div>
-    );
+  if (!routeSessionId || !routeProjectId) {
+    return <Navigate replace to="/" />;
   }
 
   return (
@@ -806,7 +767,7 @@ export function App() {
                 <button
                   className="pane__button"
                   onClick={() => {
-                    clearCurrentSession();
+                    leaveWorkspace();
                   }}
                   type="button"
                 >
@@ -850,5 +811,15 @@ export function App() {
         </footer>
       </div>
     </div>
+  );
+}
+
+export function App() {
+  return (
+    <Routes>
+      <Route element={<LauncherPage />} path="/" />
+      <Route element={<WorkspacePage />} path="/projects/:projectId/sessions/:sessionId" />
+      <Route element={<Navigate replace to="/" />} path="*" />
+    </Routes>
   );
 }
