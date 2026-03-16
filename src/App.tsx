@@ -12,6 +12,20 @@ type PaneRuntime = {
   state: "booting" | "live" | "exited";
 };
 
+type ProjectSummary = {
+  activeSessionId: string | null;
+  createdAt: string;
+  id: string;
+  initialPrompt: string;
+  lastOpenedAt: string;
+  lastSessionState: "booting" | "live" | "exited" | null;
+  lastSessionUpdatedAt: string | null;
+  latestSessionId: string | null;
+  title: string;
+  updatedAt: string;
+  workspaceDir: string;
+};
+
 type BrowserTmuxDebugApi = {
   clearSession: () => void;
   getPaneText: (paneId: PaneId) => string;
@@ -19,6 +33,7 @@ type BrowserTmuxDebugApi = {
     connectionState: ConnectionState;
     cwd: string;
     previewPort: number | null;
+    projectId: string | null;
     runtime: Record<PaneId, PaneRuntime>;
     sessionId: string | null;
     shell: string;
@@ -35,6 +50,7 @@ declare global {
 }
 
 const SESSION_STORAGE_KEY = "browser-tmux/build-session-id";
+const NEW_PROJECT_ACTION_ID = "__new__";
 
 function createInitialRuntime(): Record<PaneId, PaneRuntime> {
   return {
@@ -93,6 +109,14 @@ function buildPreviewUrl(previewPort: number | null) {
   return `${window.location.protocol}//${window.location.hostname}:${previewPort}`;
 }
 
+function formatProjectTime(value: string | null) {
+  if (!value) {
+    return "unknown";
+  }
+
+  return new Date(value).toLocaleString();
+}
+
 export function App() {
   const pane = PANES[0];
   const sessionIdRef = useRef<string | null>(readStoredSessionId());
@@ -112,6 +136,11 @@ export function App() {
   );
   const [cwd, setCwd] = useState("");
   const [previewPort, setPreviewPort] = useState<number | null>(null);
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectsError, setProjectsError] = useState("");
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [projectActionId, setProjectActionId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(sessionIdRef.current);
   const [shell, setShell] = useState("");
   const [workspaceDir, setWorkspaceDir] = useState("");
@@ -136,6 +165,7 @@ export function App() {
     pendingSnapshotRef.current = createPendingSnapshotBuffer();
     setCwd("");
     setPreviewPort(null);
+    setProjectId(null);
     setShell("");
     setWorkspaceDir("");
     setRuntime(createInitialRuntime());
@@ -143,6 +173,29 @@ export function App() {
     for (const terminal of terminalsRef.current.values()) {
       terminal.reset();
     }
+  };
+
+  const connectToSession = (next: {
+    projectId?: string | null;
+    previewPort?: number | null;
+    sessionId: string;
+    workspaceDir?: string;
+  }) => {
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current);
+    }
+
+    resetClientSessionState();
+    sessionIdRef.current = next.sessionId;
+    persistSessionId(next.sessionId);
+    setSessionId(next.sessionId);
+    setProjectId(next.projectId ?? null);
+    setPreviewPort(next.previewPort ?? null);
+    setWorkspaceDir(next.workspaceDir ?? "");
+    setConnectionState("connecting");
+    setPreviewRefreshKey(0);
+    setIsPreviewReady(false);
+    setCreateError("");
   };
 
   const clearCurrentSession = () => {
@@ -156,9 +209,11 @@ export function App() {
     persistSessionId(null);
     setSessionId(null);
     setConnectionState("idle");
+    setPrompt("");
+    setProjectActionId(null);
+    setCreateError("");
     resetClientSessionState();
     setPreviewRefreshKey(0);
-    setCreateError("");
   };
 
   const sendMessage = (message: unknown) => {
@@ -235,6 +290,7 @@ export function App() {
           sessionIdRef.current = message.sessionId;
           persistSessionId(message.sessionId);
           setSessionId(message.sessionId);
+          setProjectId(message.projectId);
           setCwd(message.cwd);
           setPreviewPort(message.previewPort);
           setShell(message.shell);
@@ -394,6 +450,50 @@ export function App() {
   }, [previewRefreshKey, previewUrl, sessionId]);
 
   useEffect(() => {
+    if (sessionId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadProjects = async () => {
+      setProjectsLoading(true);
+      setProjectsError("");
+
+      try {
+        const response = await fetch("/api/projects");
+
+        if (!response.ok) {
+          const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(payload?.error ?? "Failed to load projects.");
+        }
+
+        const payload = (await response.json()) as {
+          projects: ProjectSummary[];
+        };
+
+        if (!cancelled) {
+          setProjects(payload.projects);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setProjectsError(error instanceof Error ? error.message : "Failed to load projects.");
+        }
+      } finally {
+        if (!cancelled) {
+          setProjectsLoading(false);
+        }
+      }
+    };
+
+    void loadProjects();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
     window.__browserTmux = {
       clearSession: clearCurrentSession,
       getPaneText: (paneId) => terminalsRef.current.get(paneId)?.getText() ?? "",
@@ -401,6 +501,7 @@ export function App() {
         connectionState,
         cwd,
         previewPort,
+        projectId,
         runtime,
         sessionId,
         shell,
@@ -424,7 +525,7 @@ export function App() {
     return () => {
       delete window.__browserTmux;
     };
-  }, [connectionState, cwd, previewPort, runtime, sessionId, shell, workspaceDir]);
+  }, [connectionState, cwd, previewPort, projectId, runtime, sessionId, shell, workspaceDir]);
 
   const handleCreateSession = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -435,6 +536,7 @@ export function App() {
     }
 
     setIsCreating(true);
+    setProjectActionId(NEW_PROJECT_ACTION_ID);
     setCreateError("");
 
     try {
@@ -454,22 +556,62 @@ export function App() {
       }
 
       const payload = (await response.json()) as {
+        projectId: string;
         previewPort: number;
         sessionId: string;
         workspaceDir: string;
       };
 
-      sessionIdRef.current = payload.sessionId;
-      persistSessionId(payload.sessionId);
-      setSessionId(payload.sessionId);
-      setPreviewPort(payload.previewPort);
-      setWorkspaceDir(payload.workspaceDir);
-      setConnectionState("connecting");
-      setPreviewRefreshKey(0);
+      connectToSession(payload);
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : "Failed to create build session.");
     } finally {
       setIsCreating(false);
+      setProjectActionId(null);
+    }
+  };
+
+  const handleContinueProject = async (project: ProjectSummary) => {
+    setProjectActionId(project.id);
+    setProjectsError("");
+
+    try {
+      if (project.activeSessionId) {
+        connectToSession({
+          projectId: project.id,
+          sessionId: project.activeSessionId,
+          workspaceDir: project.workspaceDir,
+        });
+        return;
+      }
+
+      const response = await fetch("/api/build-sessions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          projectId: project.id,
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? "Failed to continue project.");
+      }
+
+      const payload = (await response.json()) as {
+        projectId: string;
+        previewPort: number;
+        sessionId: string;
+        workspaceDir: string;
+      };
+
+      connectToSession(payload);
+    } catch (error) {
+      setProjectsError(error instanceof Error ? error.message : "Failed to continue project.");
+    } finally {
+      setProjectActionId(null);
     }
   };
 
@@ -483,35 +625,101 @@ export function App() {
               <p className="eyebrow">codex builder</p>
               <h1>说出需求，直接生成一个可预览的应用工作台。</h1>
               <p className="launcher__lede">
-                后端会创建独立 workspace，启动 codex，默认按 Vite + React + TypeScript
-                的方向开始实现，并把 dev server 接到右侧预览窗口。
+                后端会为每个项目保留独立 workspace，并把项目元数据持久化到 Postgres。
+                你可以新建任务，也可以回到已有项目继续构建。
               </p>
             </div>
 
-            <form className="launcher__form" onSubmit={handleCreateSession}>
-              <label className="launcher__label" htmlFor="prompt">
-                你想做什么
-              </label>
-              <textarea
-                className="launcher__textarea"
-                id="prompt"
-                onChange={(event) => {
-                  setPrompt(event.target.value);
-                }}
-                placeholder="例如：做一个面向健身工作室的预约网站，要有课程列表、教练介绍、移动端优先设计。"
-                rows={8}
-                value={prompt}
-              />
-              {createError ? <p className="launcher__error">{createError}</p> : null}
-              <div className="launcher__actions">
-                <button className="launcher__button" disabled={isCreating} type="submit">
-                  {isCreating ? "starting codex..." : "开始构建"}
-                </button>
-                <p className="launcher__hint">
-                  创建后会进入工作台，并自动保留刷新后的终端会话。
-                </p>
-              </div>
-            </form>
+            <div className="launcher__rail">
+              <form className="launcher__form" onSubmit={handleCreateSession}>
+                <label className="launcher__label" htmlFor="prompt">
+                  新项目需求
+                </label>
+                <textarea
+                  className="launcher__textarea"
+                  id="prompt"
+                  onChange={(event) => {
+                    setPrompt(event.target.value);
+                  }}
+                  placeholder="例如：做一个面向健身工作室的预约网站，要有课程列表、教练介绍、移动端优先设计。"
+                  rows={8}
+                  value={prompt}
+                />
+                {createError ? <p className="launcher__error">{createError}</p> : null}
+                <div className="launcher__actions">
+                  <button
+                    className="launcher__button"
+                    disabled={isCreating}
+                    type="submit"
+                  >
+                    {isCreating ? "starting codex..." : "开始新项目"}
+                  </button>
+                  <p className="launcher__hint">
+                    创建后会进入工作台，并自动保留刷新后的终端会话。
+                  </p>
+                </div>
+              </form>
+
+              <section className="project-list">
+                <header className="project-list__header">
+                  <div>
+                    <p className="launcher__label">已有项目</p>
+                    <p className="project-list__lede">
+                      服务重启后，这里仍然会保留你的项目入口。
+                    </p>
+                  </div>
+                </header>
+
+                {projectsError ? <p className="launcher__error">{projectsError}</p> : null}
+
+                {projectsLoading ? (
+                  <p className="project-list__empty">Loading projects...</p>
+                ) : projects.length > 0 ? (
+                  <div className="project-list__items">
+                    {projects.map((project) => (
+                      <article className="project-card" key={project.id}>
+                        <div className="project-card__copy">
+                          <div className="project-card__topline">
+                            <p className="project-card__title">{project.title}</p>
+                            <span
+                              className={`project-card__status project-card__status--${project.activeSessionId ? "active" : (project.lastSessionState ?? "idle")}`}
+                            >
+                              {project.activeSessionId
+                                ? "live"
+                                : project.lastSessionState ?? "saved"}
+                            </span>
+                          </div>
+                          <p className="project-card__prompt">{project.initialPrompt}</p>
+                          <p className="project-card__meta">
+                            last opened {formatProjectTime(project.lastOpenedAt)}
+                          </p>
+                          <p className="project-card__path">{project.workspaceDir}</p>
+                        </div>
+
+                        <button
+                          className="launcher__button"
+                          disabled={projectActionId === project.id}
+                          onClick={() => {
+                            void handleContinueProject(project);
+                          }}
+                          type="button"
+                        >
+                          {projectActionId === project.id
+                            ? "opening..."
+                            : project.activeSessionId
+                              ? "继续会话"
+                              : "重新进入"}
+                        </button>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="project-list__empty">
+                    还没有持久化项目。先新建一个任务。
+                  </p>
+                )}
+              </section>
+            </div>
           </section>
         </div>
       </div>
@@ -602,7 +810,7 @@ export function App() {
                   }}
                   type="button"
                 >
-                  new task
+                  projects
                 </button>
               </div>
             </header>
@@ -628,16 +836,16 @@ export function App() {
 
         <footer className="statusbar">
           <div className="statusbar__pill">
+            <span>project</span>
+            <strong>{projectId ?? "preparing"}</strong>
+          </div>
+          <div className="statusbar__pill">
             <span>workspace</span>
             <strong>{workspaceDir || "preparing"}</strong>
           </div>
           <div className="statusbar__pill">
             <span>shell</span>
             <strong>{shell || "resolving"}</strong>
-          </div>
-          <div className="statusbar__pill">
-            <span>refresh</span>
-            <strong>same session, same terminal history</strong>
           </div>
         </footer>
       </div>

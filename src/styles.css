@@ -154,6 +154,12 @@ textarea {
   gap: 16px;
 }
 
+.launcher__rail {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
 .launcher__lede {
   margin: 0;
   color: var(--text-muted);
@@ -235,6 +241,119 @@ textarea {
 }
 
 .launcher__error {
+  color: var(--danger);
+}
+
+.project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px;
+  border-radius: 18px;
+  background: rgba(7, 14, 11, 0.7);
+  border: 1px solid rgba(154, 230, 110, 0.1);
+}
+
+.project-list__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+
+.project-list__lede,
+.project-list__empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+.project-list__items {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 460px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.project-card {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: start;
+  padding: 16px;
+  border-radius: 16px;
+  background: rgba(10, 20, 15, 0.84);
+  border: 1px solid rgba(154, 230, 110, 0.1);
+}
+
+.project-card__copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.project-card__topline {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.project-card__title,
+.project-card__prompt,
+.project-card__meta,
+.project-card__path {
+  margin: 0;
+}
+
+.project-card__title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.project-card__prompt,
+.project-card__meta,
+.project-card__path {
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.project-card__prompt {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.project-card__path {
+  font-family: "Iosevka Term", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.project-card__status {
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  border: 1px solid rgba(154, 230, 110, 0.14);
+  color: var(--text-muted);
+}
+
+.project-card__status--active,
+.project-card__status--live {
+  color: var(--accent);
+}
+
+.project-card__status--booting {
+  color: var(--warn);
+}
+
+.project-card__status--exited {
   color: var(--danger);
 }
 
@@ -406,5 +525,9 @@ textarea {
 
   .launcher {
     padding: 24px;
+  }
+
+  .project-card {
+    flex-direction: column;
   }
 }

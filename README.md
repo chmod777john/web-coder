@@ -3,15 +3,18 @@
 一个让用户用自然语言启动 `codex` 构建任务的 Web 应用。
 
 - 首屏是需求输入框。
-- 提交后，后端会在 `/workspaces/codex-runs/<sessionId>` 创建独立 workspace。
+- 首页也会列出已经持久化的项目，允许重新进入。
+- 新项目提交后，后端会在 `/workspaces/codex-runs/<projectId>` 创建独立 workspace。
 - 然后自动启动一个 `codex` 交互会话，并把它接到页面左侧终端。
 - 右侧是预览窗口，目标是承载 `codex` 生成应用的 dev server。
 - 浏览器刷新后会回到同一个构建会话，并恢复已有终端历史。
+- 服务重启后，项目元数据仍然会从 PostgreSQL 恢复，用户可以继续进入已有项目。
 
 ## 开发
 
 ```bash
 bun install
+bun run db:up
 bun run dev
 ```
 
@@ -19,8 +22,11 @@ bun run dev
 
 ## 当前架构
 
+- 持久化: `postgres` + Docker PostgreSQL
 - 后端: `express + ws + node-pty`
 - 前端: `react + vite + xterm.js`
+- 项目接口:
+  - `GET /api/projects`
 - 构建会话接口:
   - `POST /api/build-sessions`
   - `GET /api/build-sessions/:sessionId`
@@ -33,12 +39,20 @@ bun run dev
 - 分配一个预览端口，范围是 `4100..4899`
 - 自动把该 workspace 写入 `~/.codex/config.toml` 的 trusted projects，避免首次 trust prompt 卡住流程
 - 自动启动 `codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen`
+- 把项目和会话元数据写入 PostgreSQL
 - 给 `codex` 注入一段固定技术约束：
   - 仅在该 workspace 下工作
   - 使用 Bun
   - 优先使用 `Vite + React + TypeScript`
   - dev server 绑定 `0.0.0.0`
   - 使用分配到的预览端口
+
+继续已有项目时，服务端会：
+
+- 复用同一个 workspace
+- 创建一个新的 `build_session` 记录
+- 如果旧会话还活着，首页会直接显示“继续会话”
+- 如果服务已经重启，首页会显示“重新进入”
 
 ## 生产构建
 
@@ -47,14 +61,35 @@ bun run build
 bun run start
 ```
 
+默认数据库连接串：
+
+```bash
+postgres://postgres:postgres@127.0.0.1:5432/web_coder
+```
+
+也可以通过 `DATABASE_URL` 覆盖。
+
 ## 说明
 
 - 当前界面是「单个 codex 终端 + 右侧预览」而不是旧版三窗格。
 - 点击终端右上角 `restart` 会重新拉起当前 `codex` 会话。
-- 点击 `new task` 会清掉当前前端会话并回到需求输入页。
+- 点击工作台右上角 `projects` 会清掉当前前端会话并回到项目页。
 - 同一个浏览器里刷新页面时，会自动重连到同一个后端 PTY，并回放已有终端历史；前提是后端服务还在运行，且浏览器没有清掉 localStorage。
 - 构建会话在没有浏览器连接后会保留 30 分钟，之后自动清理。
+- 项目列表和最近会话信息会持久化到 PostgreSQL，所以服务重启后不会丢。
 - 页面会暴露一个轻量调试桥 `window.__browserTmux`，便于在浏览器 DevTools 或自动化脚本里直接发送输入、读取窗格文本和触发重启。
+
+## 本地 PostgreSQL
+
+```bash
+bun run db:up
+```
+
+停止数据库：
+
+```bash
+bun run db:down
+```
 
 ## 本地隔离浏览器栈
 

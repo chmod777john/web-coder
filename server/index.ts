@@ -11,6 +11,17 @@ import express from "express";
 import { spawn, type IPty } from "node-pty";
 import { WebSocketServer, type WebSocket } from "ws";
 
+import {
+  createProjectWithSession,
+  createSessionForProject,
+  getBuildSessionRecord,
+  getDatabaseUrl,
+  getProject,
+  initDatabase,
+  listProjects,
+  type PersistedSessionState,
+  updateBuildSessionSnapshot,
+} from "./db";
 import { PANES, type ClientMessage, type PaneId, type ServerMessage } from "../shared/protocol";
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -41,6 +52,7 @@ type PaneRuntime = {
 
 type BuildSessionConfig = {
   id: string;
+  projectId: string;
   previewPort: number;
   userPrompt: string;
   workspaceDir: string;
@@ -70,6 +82,29 @@ function tomlEscape(value: string) {
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function toProjectTitle(prompt: string) {
+  const collapsed = prompt.replace(/\s+/g, " ").trim();
+
+  if (collapsed.length <= 72) {
+    return collapsed;
+  }
+
+  return `${collapsed.slice(0, 69).trimEnd()}...`;
+}
+
+function createContinuationPrompt(initialPrompt: string, workspaceDir: string) {
+  return [
+    "Continue working on the existing project in this workspace.",
+    "",
+    "Original user request:",
+    initialPrompt,
+    "",
+    `Current workspace: ${workspaceDir}`,
+    "",
+    "Start by reviewing the existing files, then continue building pragmatically.",
+  ].join("\n");
 }
 
 function upsertProjectTrust(config: string, projectPath: string) {
@@ -234,6 +269,7 @@ class BuildSession {
   readonly #shell = resolveShell();
   readonly #sockets = new Set<WebSocket>();
   #cleanupTimer: NodeJS.Timeout | null = null;
+  #persistTimer: NodeJS.Timeout | null = null;
 
   constructor(readonly config: BuildSessionConfig) {
     mkdirSync(config.workspaceDir, { recursive: true });
@@ -244,8 +280,20 @@ class BuildSession {
     return this.config.id;
   }
 
+  get projectId() {
+    return this.config.projectId;
+  }
+
   get previewPort() {
     return this.config.previewPort;
+  }
+
+  get shell() {
+    return this.#shell;
+  }
+
+  get workspaceDir() {
+    return this.config.workspaceDir;
   }
 
   attach(socket: WebSocket) {
@@ -255,6 +303,7 @@ class BuildSession {
     this.sendTo(socket, {
       type: "session",
       sessionId: this.config.id,
+      projectId: this.config.projectId,
       panes: PANES,
       cwd: this.config.workspaceDir,
       previewPort: this.config.previewPort,
@@ -275,9 +324,11 @@ class BuildSession {
 
   dispose() {
     this.clearCleanupTimer();
+    this.clearPersistTimer();
     this.#pane.pty?.kill();
     this.#pane.pty = null;
     this.#sockets.clear();
+    void this.persistSnapshot();
   }
 
   handleMessage(raw: string) {
@@ -359,6 +410,7 @@ class BuildSession {
         exitCode: null,
         signal: null,
       });
+      this.schedulePersistSnapshot();
 
       setTimeout(() => {
         if (this.#pane.pty !== pty) {
@@ -379,6 +431,7 @@ class BuildSession {
           paneId,
           data,
         });
+        this.schedulePersistSnapshot();
       });
 
       pty.onExit(({ exitCode, signal }) => {
@@ -400,6 +453,7 @@ class BuildSession {
           exitCode: exitCode ?? null,
           signal: signal ?? null,
         });
+        this.schedulePersistSnapshot();
       });
     } catch (error) {
       this.#pane.pty = null;
@@ -413,6 +467,7 @@ class BuildSession {
         type: "error",
         message: error instanceof Error ? error.message : "Failed to spawn shell.",
       });
+      this.schedulePersistSnapshot();
     }
   }
 
@@ -465,6 +520,42 @@ class BuildSession {
     this.#cleanupTimer = null;
   }
 
+  private schedulePersistSnapshot() {
+    if (this.#persistTimer) {
+      return;
+    }
+
+    this.#persistTimer = setTimeout(() => {
+      this.#persistTimer = null;
+      void this.persistSnapshot();
+    }, 700);
+  }
+
+  private clearPersistTimer() {
+    if (!this.#persistTimer) {
+      return;
+    }
+
+    clearTimeout(this.#persistTimer);
+    this.#persistTimer = null;
+  }
+
+  private async persistSnapshot() {
+    const state: PersistedSessionState = this.#pane.status.state;
+
+    try {
+      await updateBuildSessionSnapshot({
+        sessionId: this.config.id,
+        terminalHistory: this.#pane.history,
+        state,
+        exitCode: this.#pane.status.exitCode,
+        signal: this.#pane.status.signal,
+      });
+    } catch (error) {
+      console.error("failed to persist session snapshot", error);
+    }
+  }
+
   private broadcast(message: ServerMessage) {
     for (const socket of this.#sockets) {
       this.sendTo(socket, message);
@@ -480,6 +571,71 @@ class BuildSession {
   }
 }
 
+async function createNewProjectSession(userPrompt: string) {
+  const projectId = randomUUID();
+  const sessionId = randomUUID();
+  const previewPort = await allocatePreviewPort();
+  const workspaceDir = resolve(RUNS_ROOT, projectId);
+  const shell = resolveShell();
+
+  await markProjectTrusted(workspaceDir);
+  await createProjectWithSession({
+    projectId,
+    sessionId,
+    title: toProjectTitle(userPrompt),
+    prompt: userPrompt,
+    workspaceDir,
+    previewPort,
+    shell,
+  });
+
+  const session = new BuildSession({
+    id: sessionId,
+    projectId,
+    previewPort,
+    userPrompt,
+    workspaceDir,
+  });
+
+  sessions.set(sessionId, session);
+  return session;
+}
+
+async function createProjectContinuationSession(projectId: string, promptOverride?: string) {
+  const project = await getProject(projectId);
+
+  if (!project) {
+    return null;
+  }
+
+  const sessionId = randomUUID();
+  const previewPort = await allocatePreviewPort();
+  const shell = resolveShell();
+  const userPrompt =
+    promptOverride?.trim() || createContinuationPrompt(project.initialPrompt, project.workspaceDir);
+
+  await markProjectTrusted(project.workspaceDir);
+  await createSessionForProject({
+    projectId,
+    sessionId,
+    prompt: userPrompt,
+    workspaceDir: project.workspaceDir,
+    previewPort,
+    shell,
+  });
+
+  const session = new BuildSession({
+    id: sessionId,
+    projectId,
+    previewPort,
+    userPrompt,
+    workspaceDir: project.workspaceDir,
+  });
+
+  sessions.set(sessionId, session);
+  return session;
+}
+
 const app = express();
 app.use(express.json());
 
@@ -489,62 +645,118 @@ const wss = new WebSocketServer({
   path: "/ws",
 });
 
-app.post("/api/build-sessions", async (req, res) => {
-  const prompt =
-    typeof req.body?.prompt === "string"
-      ? req.body.prompt.trim()
-      : "";
+app.get("/api/projects", async (_req, res) => {
+  try {
+    const projects = await listProjects();
 
-  if (!prompt) {
-    res.status(400).json({
-      error: "Prompt is required.",
+    res.json({
+      ok: true,
+      projects: projects.map((project) => ({
+        ...project,
+        activeSessionId:
+          project.latestSessionId && sessions.has(project.latestSessionId)
+            ? project.latestSessionId
+            : null,
+      })),
     });
-    return;
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to load projects.",
+    });
   }
-
-  const sessionId = randomUUID();
-  const previewPort = await allocatePreviewPort();
-  const workspaceDir = resolve(RUNS_ROOT, sessionId);
-
-  await markProjectTrusted(workspaceDir);
-
-  const session = new BuildSession({
-    id: sessionId,
-    previewPort,
-    userPrompt: prompt,
-    workspaceDir,
-  });
-
-  sessions.set(sessionId, session);
-
-  res.status(201).json({
-    ok: true,
-    previewPort,
-    sessionId,
-    workspaceDir,
-  });
 });
 
-app.get("/api/build-sessions/:sessionId", (req, res) => {
-  const session = sessions.get(req.params.sessionId);
+app.post("/api/build-sessions", async (req, res) => {
+  try {
+    const prompt =
+      typeof req.body?.prompt === "string"
+        ? req.body.prompt.trim()
+        : "";
+    const projectId =
+      typeof req.body?.projectId === "string"
+        ? req.body.projectId.trim()
+        : "";
 
-  if (!session) {
-    res.status(404).json({
-      error: "Session not found.",
+    if (!projectId && !prompt) {
+      res.status(400).json({
+        error: "Prompt is required for a new project.",
+      });
+      return;
+    }
+
+    const session = projectId
+      ? await createProjectContinuationSession(projectId, prompt)
+      : await createNewProjectSession(prompt);
+
+    if (!session) {
+      res.status(404).json({
+        error: "Project not found.",
+      });
+      return;
+    }
+
+    res.status(201).json({
+      ok: true,
+      projectId: session.projectId,
+      previewPort: session.previewPort,
+      sessionId: session.id,
+      workspaceDir: session.workspaceDir,
     });
-    return;
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to create build session.",
+    });
   }
+});
 
-  res.json({
-    ok: true,
-    previewPort: session.previewPort,
-    sessionId: session.id,
-  });
+app.get("/api/build-sessions/:sessionId", async (req, res) => {
+  try {
+    const liveSession = sessions.get(req.params.sessionId);
+
+    if (liveSession) {
+      res.json({
+        ok: true,
+        active: true,
+        projectId: liveSession.projectId,
+        previewPort: liveSession.previewPort,
+        sessionId: liveSession.id,
+        shell: liveSession.shell,
+        workspaceDir: liveSession.workspaceDir,
+      });
+      return;
+    }
+
+    const session = await getBuildSessionRecord(req.params.sessionId);
+
+    if (!session) {
+      res.status(404).json({
+        error: "Session not found.",
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      active: false,
+      projectId: session.projectId,
+      previewPort: session.previewPort,
+      sessionId: session.id,
+      shell: session.shell,
+      state: session.state,
+      updatedAt: session.updatedAt,
+      workspaceDir: session.workspaceDir,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to load build session.",
+    });
+  }
 });
 
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
+    database: "connected",
     sessions: sessions.size,
   });
 });
@@ -587,6 +799,18 @@ wss.on("connection", (socket, request) => {
   });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`browser-tmux server listening on http://localhost:${PORT}`);
+async function bootstrap() {
+  await initDatabase();
+  const databaseUrl = new URL(getDatabaseUrl());
+  const databaseLabel = `${databaseUrl.protocol}//${databaseUrl.hostname}:${databaseUrl.port}${databaseUrl.pathname}`;
+
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`browser-tmux server listening on http://localhost:${PORT}`);
+    console.log(`postgres connected at ${databaseLabel}`);
+  });
+}
+
+bootstrap().catch((error) => {
+  console.error("failed to start server", error);
+  process.exit(1);
 });

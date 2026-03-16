@@ -30,6 +30,7 @@ export type ServerMessage =
   | {
       type: "session";
       sessionId: string;
+      projectId: string;
       panes: readonly PaneDefinition[];
       cwd: string;
       previewPort: number;
