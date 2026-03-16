@@ -34,6 +34,7 @@ export type ServerMessage =
       panes: readonly PaneDefinition[];
       cwd: string;
       previewPort: number;
+      previewUrl: string | null;
       shell: string;
       workspaceDir: string;
     }
@@ -56,6 +57,10 @@ export type ServerMessage =
       state: "live" | "exited";
       exitCode: number | null;
       signal: number | null;
+    }
+  | {
+      type: "preview";
+      previewUrl: string | null;
     }
   | {
       type: "error";

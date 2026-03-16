@@ -30,6 +30,7 @@ type ProjectSummary = {
 type BuildSessionPayload = {
   projectId: string;
   previewPort: number;
+  previewUrl: string | null;
   sessionId: string;
   workspaceDir: string;
 };
@@ -40,6 +41,7 @@ type BrowserTmuxDebugApi = {
   getState: () => {
     connectionState: ConnectionState;
     cwd: string;
+    previewTarget: string | null;
     previewPort: number | null;
     projectId: string | null;
     runtime: Record<PaneId, PaneRuntime>;
@@ -86,12 +88,41 @@ function getSocketUrl(sessionId: string) {
   return url.toString();
 }
 
-function buildPreviewUrl(previewPort: number | null) {
-  if (!previewPort) {
+function resolvePreviewUrl(previewTarget: string | null) {
+  if (!previewTarget) {
     return "";
   }
 
-  return `${window.location.protocol}//${window.location.hostname}:${previewPort}`;
+  if (previewTarget.startsWith("local://")) {
+    const port = previewTarget.slice("local://".length);
+    return `${window.location.protocol}//${window.location.hostname}:${port}`;
+  }
+
+  return previewTarget;
+}
+
+function formatPreviewTarget(previewTarget: string | null) {
+  if (!previewTarget) {
+    return "preview target not reported yet";
+  }
+
+  if (previewTarget.startsWith("local://")) {
+    return `local app on ${previewTarget.slice("local://".length)}`;
+  }
+
+  return previewTarget;
+}
+
+function getPreviewStatusText(previewTarget: string | null, isPreviewReady: boolean) {
+  if (!previewTarget) {
+    return "waiting for codex to report a preview target";
+  }
+
+  if (isPreviewReady) {
+    return formatPreviewTarget(previewTarget);
+  }
+
+  return `probing ${formatPreviewTarget(previewTarget)}`;
 }
 
 function formatProjectTime(value: string | null) {
@@ -356,6 +387,7 @@ function WorkspacePage() {
   );
   const [cwd, setCwd] = useState("");
   const [previewPort, setPreviewPort] = useState<number | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<string | null>(null);
   const [projectId, setProjectId] = useState<string | null>(routeProjectId ?? null);
   const [sessionId, setSessionId] = useState<string | null>(routeSessionId ?? null);
   const [shell, setShell] = useState("");
@@ -364,7 +396,7 @@ function WorkspacePage() {
   const [previewRefreshKey, setPreviewRefreshKey] = useState(0);
   const [runtime, setRuntime] = useState<Record<PaneId, PaneRuntime>>(createInitialRuntime);
 
-  const previewUrl = useMemo(() => buildPreviewUrl(previewPort), [previewPort]);
+  const previewUrl = useMemo(() => resolvePreviewUrl(previewTarget), [previewTarget]);
   const connectionLabel = useMemo(() => {
     switch (connectionState) {
       case "connected":
@@ -394,6 +426,7 @@ function WorkspacePage() {
     pendingSnapshotRef.current = createPendingSnapshotBuffer();
     setCwd("");
     setPreviewPort(null);
+    setPreviewTarget(null);
     setShell("");
     setWorkspaceDir("");
     setRuntime(createInitialRuntime());
@@ -493,6 +526,7 @@ function WorkspacePage() {
           setProjectId(message.projectId);
           setCwd(message.cwd);
           setPreviewPort(message.previewPort);
+          setPreviewTarget(message.previewUrl);
           setShell(message.shell);
           setWorkspaceDir(message.workspaceDir);
           setRuntime(createInitialRuntime());
@@ -530,6 +564,10 @@ function WorkspacePage() {
         }
         case "output": {
           writeToPane(message.paneId, message.data);
+          return;
+        }
+        case "preview": {
+          setPreviewTarget(message.previewUrl);
           return;
         }
         case "status": {
@@ -656,6 +694,7 @@ function WorkspacePage() {
       getState: () => ({
         connectionState,
         cwd,
+        previewTarget,
         previewPort,
         projectId,
         runtime,
@@ -681,7 +720,7 @@ function WorkspacePage() {
     return () => {
       delete window.__browserTmux;
     };
-  }, [connectionState, cwd, previewPort, projectId, runtime, sessionId, shell, workspaceDir]);
+  }, [connectionState, cwd, previewPort, previewTarget, projectId, runtime, sessionId, shell, workspaceDir]);
 
   if (!routeSessionId || !routeProjectId) {
     return <Navigate replace to="/" />;
@@ -702,8 +741,8 @@ function WorkspacePage() {
               <strong>{connectionLabel}</strong>
             </div>
             <div className="metric">
-              <span>preview</span>
-              <strong>{previewPort ? `:${previewPort}` : "pending"}</strong>
+              <span>target</span>
+              <strong>{formatPreviewTarget(previewTarget)}</strong>
             </div>
             <div className="metric">
               <span>session</span>
@@ -749,9 +788,7 @@ function WorkspacePage() {
               <div>
                 <p className="pane__title">preview</p>
                 <p className="pane__subtitle">
-                  {previewUrl && isPreviewReady
-                    ? previewUrl
-                    : "waiting for the app dev server to come up"}
+                  {getPreviewStatusText(previewTarget, isPreviewReady)}
                 </p>
               </div>
               <div className="pane__actions">
@@ -785,9 +822,13 @@ function WorkspacePage() {
                 />
               ) : (
                 <div className="preview__placeholder">
-                  <strong>Waiting for preview server</strong>
+                  <strong>
+                    {previewTarget ? "Waiting for preview target to respond" : "Waiting for preview target"}
+                  </strong>
                   <p>
-                    Codex will start the generated app on the assigned port when it is ready.
+                    {previewTarget
+                      ? `Current target: ${formatPreviewTarget(previewTarget)}`
+                      : "Codex must call the preview API with either local://<port> or a remote https:// URL."}
                   </p>
                 </div>
               )}
@@ -796,6 +837,10 @@ function WorkspacePage() {
         </main>
 
         <footer className="statusbar">
+          <div className="statusbar__pill">
+            <span>assigned port</span>
+            <strong>{previewPort ? `:${previewPort}` : "pending"}</strong>
+          </div>
           <div className="statusbar__pill">
             <span>project</span>
             <strong>{projectId ?? "preparing"}</strong>

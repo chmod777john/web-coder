@@ -20,6 +20,7 @@ import {
   initDatabase,
   listProjects,
   type PersistedSessionState,
+  updateBuildSessionPreview,
   updateBuildSessionSnapshot,
 } from "./db";
 import { PANES, type ClientMessage, type PaneId, type ServerMessage } from "../shared/protocol";
@@ -54,6 +55,8 @@ type BuildSessionConfig = {
   id: string;
   projectId: string;
   previewPort: number;
+  previewToken: string;
+  previewUrl: string | null;
   userPrompt: string;
   workspaceDir: string;
 };
@@ -92,6 +95,58 @@ function toProjectTitle(prompt: string) {
   }
 
   return `${collapsed.slice(0, 69).trimEnd()}...`;
+}
+
+function buildPreviewUpdateEndpoint(sessionId: string) {
+  return `http://127.0.0.1:${PORT}/api/build-sessions/${sessionId}/preview-url`;
+}
+
+function normalizePreviewUrl(input: string | null) {
+  if (input === null) {
+    return null;
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.startsWith("local://")) {
+    const portValue = trimmed.slice("local://".length);
+    const port = Number(portValue);
+
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+      throw new Error("Invalid local preview port.");
+    }
+
+    return `local://${port}`;
+  }
+
+  const parsed = new URL(trimmed);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Preview URL must use http or https.");
+  }
+
+  if (["127.0.0.1", "localhost", "0.0.0.0"].includes(parsed.hostname)) {
+    const port = Number(parsed.port);
+
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+      throw new Error("Loopback preview URLs must include a valid port.");
+    }
+
+    return `local://${port}`;
+  }
+
+  return parsed.toString();
+}
+
+function getBearerToken(headerValue: string | undefined) {
+  if (!headerValue) {
+    return "";
+  }
+
+  const match = headerValue.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() ?? "";
 }
 
 function createContinuationPrompt(initialPrompt: string, workspaceDir: string) {
@@ -206,7 +261,13 @@ function appendHistory(history: string, chunk: string) {
   return next.slice(next.length - HISTORY_LIMIT);
 }
 
-function composeAgentPrompt(userPrompt: string, workspaceDir: string, previewPort: number) {
+function composeAgentPrompt(
+  userPrompt: string,
+  workspaceDir: string,
+  previewPort: number,
+  previewEndpoint: string,
+  previewToken: string,
+) {
   return [
     "Build a runnable web app for the user.",
     "",
@@ -218,8 +279,19 @@ function composeAgentPrompt(userPrompt: string, workspaceDir: string, previewPor
     "- Create the project from scratch if needed.",
     "- Use Bun for package management.",
     "- Use Vite + React + TypeScript unless the request strongly requires something else.",
-    `- Run the app dev server on port ${previewPort}.`,
-    "- Bind the dev server to 0.0.0.0 so it is reachable from the browser preview.",
+    `- If you run a local dev server, prefer port ${previewPort}.`,
+    "- Bind any local dev server to 0.0.0.0.",
+    "- You may deploy the app somewhere like Vercel if that is the better path.",
+    "- You must explicitly report the preview target to the preview API whenever it changes.",
+    "",
+    "Preview API:",
+    `- Endpoint: ${previewEndpoint}`,
+    `- Bearer token: ${previewToken}`,
+    '- For remote deployments, send {"url":"https://your-app.example.com"}.',
+    `- For local previews on the assigned port, send {"url":"local://${previewPort}"}.`,
+    "- The web UI will not guess the preview target for you. If you do not call the API, the preview iframe will stay blank.",
+    '- Example command: curl -X POST "$CODEX_PREVIEW_URL_ENDPOINT" -H "Authorization: Bearer $CODEX_PREVIEW_BEARER_TOKEN" -H "Content-Type: application/json" -d \'{"url":"https://example.vercel.app"}\'',
+    "- Call the same API again if you switch from local preview to a deployed URL later.",
     "- Keep the dev server running once the first working version is ready.",
     "- Make practical implementation choices and move forward without asking unnecessary questions.",
     "",
@@ -266,12 +338,14 @@ const sessions = new Map<string, BuildSession>();
 
 class BuildSession {
   readonly #pane = createPaneRuntime();
+  #previewUrl: string | null;
   readonly #shell = resolveShell();
   readonly #sockets = new Set<WebSocket>();
   #cleanupTimer: NodeJS.Timeout | null = null;
   #persistTimer: NodeJS.Timeout | null = null;
 
   constructor(readonly config: BuildSessionConfig) {
+    this.#previewUrl = config.previewUrl;
     mkdirSync(config.workspaceDir, { recursive: true });
     this.spawnPane("agent");
   }
@@ -286,6 +360,10 @@ class BuildSession {
 
   get previewPort() {
     return this.config.previewPort;
+  }
+
+  get previewUrl() {
+    return this.#previewUrl;
   }
 
   get shell() {
@@ -307,6 +385,7 @@ class BuildSession {
       panes: PANES,
       cwd: this.config.workspaceDir,
       previewPort: this.config.previewPort,
+      previewUrl: this.#previewUrl,
       shell: this.#shell,
       workspaceDir: this.config.workspaceDir,
     });
@@ -369,6 +448,20 @@ class BuildSession {
     }
   }
 
+  async updatePreviewUrl(nextPreviewUrl: string | null) {
+    this.#previewUrl = nextPreviewUrl;
+
+    this.broadcast({
+      type: "preview",
+      previewUrl: nextPreviewUrl,
+    });
+
+    await updateBuildSessionPreview({
+      previewUrl: nextPreviewUrl,
+      sessionId: this.config.id,
+    });
+  }
+
   private restartPane() {
     const current = this.#pane.pty;
 
@@ -391,6 +484,9 @@ class BuildSession {
         cwd: this.config.workspaceDir,
         env: {
           ...process.env,
+          CODEX_LOCAL_PREVIEW_PORT: String(this.config.previewPort),
+          CODEX_PREVIEW_BEARER_TOKEN: this.config.previewToken,
+          CODEX_PREVIEW_URL_ENDPOINT: buildPreviewUpdateEndpoint(this.config.id),
           COLORTERM: "truecolor",
           TERM: "xterm-256color",
         },
@@ -476,6 +572,8 @@ class BuildSession {
       this.config.userPrompt,
       this.config.workspaceDir,
       this.config.previewPort,
+      buildPreviewUpdateEndpoint(this.config.id),
+      this.config.previewToken,
     );
 
     return [
@@ -575,6 +673,7 @@ async function createNewProjectSession(userPrompt: string) {
   const projectId = randomUUID();
   const sessionId = randomUUID();
   const previewPort = await allocatePreviewPort();
+  const previewToken = randomUUID();
   const workspaceDir = resolve(RUNS_ROOT, projectId);
   const shell = resolveShell();
 
@@ -584,6 +683,8 @@ async function createNewProjectSession(userPrompt: string) {
     sessionId,
     title: toProjectTitle(userPrompt),
     prompt: userPrompt,
+    previewToken,
+    previewUrl: null,
     workspaceDir,
     previewPort,
     shell,
@@ -593,6 +694,8 @@ async function createNewProjectSession(userPrompt: string) {
     id: sessionId,
     projectId,
     previewPort,
+    previewToken,
+    previewUrl: null,
     userPrompt,
     workspaceDir,
   });
@@ -610,7 +713,10 @@ async function createProjectContinuationSession(projectId: string, promptOverrid
 
   const sessionId = randomUUID();
   const previewPort = await allocatePreviewPort();
+  const previewToken = randomUUID();
   const shell = resolveShell();
+  const previousSession =
+    project.latestSessionId ? await getBuildSessionRecord(project.latestSessionId) : null;
   const userPrompt =
     promptOverride?.trim() || createContinuationPrompt(project.initialPrompt, project.workspaceDir);
 
@@ -619,6 +725,8 @@ async function createProjectContinuationSession(projectId: string, promptOverrid
     projectId,
     sessionId,
     prompt: userPrompt,
+    previewToken,
+    previewUrl: previousSession?.previewUrl ?? null,
     workspaceDir: project.workspaceDir,
     previewPort,
     shell,
@@ -628,6 +736,8 @@ async function createProjectContinuationSession(projectId: string, promptOverrid
     id: sessionId,
     projectId,
     previewPort,
+    previewToken,
+    previewUrl: previousSession?.previewUrl ?? null,
     userPrompt,
     workspaceDir: project.workspaceDir,
   });
@@ -699,6 +809,7 @@ app.post("/api/build-sessions", async (req, res) => {
       ok: true,
       projectId: session.projectId,
       previewPort: session.previewPort,
+      previewUrl: session.previewUrl,
       sessionId: session.id,
       workspaceDir: session.workspaceDir,
     });
@@ -719,6 +830,7 @@ app.get("/api/build-sessions/:sessionId", async (req, res) => {
         active: true,
         projectId: liveSession.projectId,
         previewPort: liveSession.previewPort,
+        previewUrl: liveSession.previewUrl,
         sessionId: liveSession.id,
         shell: liveSession.shell,
         workspaceDir: liveSession.workspaceDir,
@@ -740,6 +852,7 @@ app.get("/api/build-sessions/:sessionId", async (req, res) => {
       active: false,
       projectId: session.projectId,
       previewPort: session.previewPort,
+      previewUrl: session.previewUrl,
       sessionId: session.id,
       shell: session.shell,
       state: session.state,
@@ -749,6 +862,51 @@ app.get("/api/build-sessions/:sessionId", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: error instanceof Error ? error.message : "Failed to load build session.",
+    });
+  }
+});
+
+app.post("/api/build-sessions/:sessionId/preview-url", async (req, res) => {
+  try {
+    const sessionId = req.params.sessionId;
+    const bearerToken = getBearerToken(req.header("authorization"));
+    const session = sessions.get(sessionId);
+
+    const persistedSession = session ? null : await getBuildSessionRecord(sessionId);
+    const expectedToken = session?.config.previewToken ?? persistedSession?.previewToken ?? "";
+
+    if (!expectedToken || bearerToken !== expectedToken) {
+      res.status(401).json({
+        error: "Invalid preview token.",
+      });
+      return;
+    }
+
+    const rawUrl =
+      req.body?.url === null
+        ? null
+        : typeof req.body?.url === "string"
+          ? req.body.url
+          : "";
+    const previewUrl = normalizePreviewUrl(rawUrl);
+
+    if (session) {
+      await session.updatePreviewUrl(previewUrl);
+    } else {
+      await updateBuildSessionPreview({
+        previewUrl,
+        sessionId,
+      });
+    }
+
+    res.json({
+      ok: true,
+      previewUrl,
+      sessionId,
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Failed to update preview URL.",
     });
   }
 });

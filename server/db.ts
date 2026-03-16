@@ -25,6 +25,8 @@ export type BuildSessionRecord = {
   id: string;
   projectId: string;
   prompt: string;
+  previewToken: string;
+  previewUrl: string | null;
   workspaceDir: string;
   previewPort: number;
   shell: string;
@@ -66,6 +68,8 @@ export async function initDatabase() {
       id text primary key,
       project_id text not null references projects(id) on delete cascade,
       prompt text not null,
+      preview_token text not null default '',
+      preview_url text,
       workspace_dir text not null,
       preview_port integer not null,
       shell text not null,
@@ -87,6 +91,16 @@ export async function initDatabase() {
     create index if not exists idx_build_sessions_project_id_created_at
     on build_sessions (project_id, created_at desc)
   `;
+
+  await sql`
+    alter table build_sessions
+    add column if not exists preview_token text not null default ''
+  `;
+
+  await sql`
+    alter table build_sessions
+    add column if not exists preview_url text
+  `;
 }
 
 export async function createProjectWithSession(input: {
@@ -94,6 +108,8 @@ export async function createProjectWithSession(input: {
   sessionId: string;
   title: string;
   prompt: string;
+  previewToken: string;
+  previewUrl: string | null;
   workspaceDir: string;
   previewPort: number;
   shell: string;
@@ -119,6 +135,8 @@ export async function createProjectWithSession(input: {
       id,
       project_id,
       prompt,
+      preview_token,
+      preview_url,
       workspace_dir,
       preview_port,
       shell,
@@ -127,6 +145,8 @@ export async function createProjectWithSession(input: {
       ${input.sessionId},
       ${input.projectId},
       ${input.prompt},
+      ${input.previewToken},
+      ${input.previewUrl},
       ${input.workspaceDir},
       ${input.previewPort},
       ${input.shell},
@@ -139,6 +159,8 @@ export async function createSessionForProject(input: {
   projectId: string;
   sessionId: string;
   prompt: string;
+  previewToken: string;
+  previewUrl: string | null;
   workspaceDir: string;
   previewPort: number;
   shell: string;
@@ -148,6 +170,8 @@ export async function createSessionForProject(input: {
       id,
       project_id,
       prompt,
+      preview_token,
+      preview_url,
       workspace_dir,
       preview_port,
       shell,
@@ -156,6 +180,8 @@ export async function createSessionForProject(input: {
       ${input.sessionId},
       ${input.projectId},
       ${input.prompt},
+      ${input.previewToken},
+      ${input.previewUrl},
       ${input.workspaceDir},
       ${input.previewPort},
       ${input.shell},
@@ -217,6 +243,8 @@ export async function getBuildSessionRecord(sessionId: string) {
       id,
       project_id as "projectId",
       prompt,
+      preview_token as "previewToken",
+      preview_url as "previewUrl",
       workspace_dir as "workspaceDir",
       preview_port as "previewPort",
       shell,
@@ -248,6 +276,19 @@ export async function updateBuildSessionSnapshot(input: {
       state = ${input.state},
       exit_code = ${input.exitCode},
       signal = ${input.signal},
+      updated_at = now()
+    where id = ${input.sessionId}
+  `;
+}
+
+export async function updateBuildSessionPreview(input: {
+  previewUrl: string | null;
+  sessionId: string;
+}) {
+  await sql`
+    update build_sessions
+    set
+      preview_url = ${input.previewUrl},
       updated_at = now()
     where id = ${input.sessionId}
   `;
