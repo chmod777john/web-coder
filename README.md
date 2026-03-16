@@ -1,3 +1,5 @@
+# 以下全是 AI 写的，仅仅是用于让教你如何启动项目，真正的个人心得在 Design.md
+
 # Browser Tmux
 
 一个让用户用自然语言启动 `codex` 构建任务的 Web 应用。
@@ -45,8 +47,10 @@ bun run dev
   - 仅在该 workspace 下工作
   - 使用 Bun
   - 优先使用 `Vite + React + TypeScript`
-  - dev server 绑定 `0.0.0.0`
-  - 使用分配到的预览端口作为本地预览优先选项
+  - 优先部署到 `Vercel`
+  - 如果不适合部署到 `Vercel`，再退回本地 dev server
+  - 本地 dev server 绑定 `0.0.0.0`
+  - 使用分配到的预览端口作为本地预览 fallback
   - 通过 preview API 主动汇报当前要显示的预览目标
 
 继续已有项目时，服务端会：
@@ -125,6 +129,30 @@ bun run db:up
 ```bash
 bun run db:down
 ```
+
+## Cloudflare Tunnel
+
+如果你想把当前的工作台直接暴露到公网，可以用仓库里的 quick tunnel 脚本：
+
+```bash
+./scripts/cloudflared-quick-tunnel.sh start
+```
+
+常用命令：
+
+```bash
+./scripts/cloudflared-quick-tunnel.sh url
+./scripts/cloudflared-quick-tunnel.sh logs
+./scripts/cloudflared-quick-tunnel.sh stop
+```
+
+默认它会把 `http://127.0.0.1:3001` 暴露成一个 `https://*.trycloudflare.com` 地址，底层使用 Cloudflare 官方 `cloudflared` Docker 镜像。
+
+注意：
+
+- 这条 tunnel 暴露的是工作台本身，不是所有本地 preview 端口。
+- 如果 `codex` 上报的是远端 URL，例如 `Vercel`，公网访问没有问题。
+- 如果 `codex` 上报的是 `local://4100` 这种本地 fallback，外网访问者通常无法直接看到这个 preview；这种场景下应继续优先让 `codex` 部署到 `Vercel`。
 
 ## 本地隔离浏览器栈
 
